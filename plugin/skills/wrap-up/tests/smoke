@@ -1,0 +1,157 @@
+#!/usr/bin/env -S python3 -I
+"""Cross-platform smoke test for wrapup-check: macOS, Linux and Windows.
+
+The full suite (run-tests) plants real watcher processes, a unix socket and a
+detached orphan, which are POSIX-only. This one covers what every platform must
+get right — config, discovery, the memory/due/temp/schedules/git sections, exit
+codes and the state file — using nothing but Python, git and the filesystem.
+
+Run it with an interpreter, not the shebang, where there is no shebang:
+    python tests\\smoke
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+CHECK = os.path.join(os.path.dirname(HERE), "wrapup-check")
+TODAY = "2026-10-31"
+FAILS = []
+
+
+def ok(cond, what):
+    print(("  pass  " if cond else "  FAIL  ") + what)
+    if not cond:
+        FAILS.append(what)
+
+
+def write(path, text, days_old=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    if days_old is not None:
+        t = time.time() - days_old * 86400
+        os.utime(path, (t, t))
+
+
+def checker(*args, state=None, env_extra=None):
+    env = {**os.environ, "WRAPUP_SESSION_AGE": "3600"}
+    env.pop("WRAPUP_CONFIG", None)
+    env.pop("WRAPUP_STATE", None)
+    if env_extra:
+        env.update(env_extra)
+    cmd = [sys.executable, "-I", CHECK, "--today", TODAY]
+    if state:
+        cmd += ["--state", state]
+    p = subprocess.run(cmd + list(args), capture_output=True, text=True, timeout=180, env=env)
+    return p.returncode, p.stdout, p.stderr
+
+
+def main():
+    print(f"wrapup-check smoke test on {sys.platform} (python {sys.version.split()[0]})")
+    base = tempfile.mkdtemp(prefix="wuc-smoke-")
+    state = os.path.join(base, "state.json")
+    try:
+        mem = os.path.join(base, "mem")
+        write(os.path.join(mem, "MEMORY.md"), "# Index\n- [Good](good.md) — ok\n- [Gone](missing.md) — broken\n")
+        write(os.path.join(mem, "good.md"),
+              "---\nname: good\ndescription: d\nmetadata:\n  type: project\n---\n\n"
+              "The token EXPIRES 2026-11-05, so this is a dated item.\n")
+        write(os.path.join(mem, "orphan.md"), "no frontmatter and not in the index\n")
+
+        tmp = os.path.join(base, "tmproot")
+        write(os.path.join(tmp, "fresh.txt"), "x")
+        write(os.path.join(tmp, "old.txt"), "y", days_old=9)
+
+        sched = os.path.join(base, "sched")
+        write(os.path.join(sched, "fresh.plist"), "<plist/>")
+        write(os.path.join(sched, "old.plist"), "<plist/>", days_old=9)
+
+        repo = os.path.join(base, "repo")
+        os.makedirs(repo)
+        g = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-C", repo]
+        subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True, capture_output=True)
+        write(os.path.join(repo, "f.txt"), "1\n")
+        subprocess.run(g + ["add", "f.txt"], check=True, capture_output=True)
+        subprocess.run(g + ["commit", "-q", "-m", "one"], check=True, capture_output=True)
+        write(os.path.join(repo, "untracked.txt"), "u\n")
+
+        cfg = {
+            "memory_dirs": [{"label": "m", "path": mem}],
+            "temp": {"roots": [tmp], "include": ["*"], "exclude": [], "stale_hours": 24},
+            "schedules": {"dirs": [{"kind": "test", "dir": sched, "suffix": ".plist"}], "commands": False},
+            "processes": {"include": ["^$never"]},
+            "repos": [repo],
+        }
+        cfg_path = os.path.join(base, "config.json")
+        write(cfg_path, json.dumps(cfg))
+
+        print("== sections")
+        rc, out, err = checker("--config", cfg_path, "--json", state=state)
+        ok(rc == 1, f"exit 1 with faults planted (got {rc}; stderr {err.strip()[:200]})")
+        res = json.loads(out)
+        m = res["sections"]["memory"][0]
+        ok(m["unindexed"] == ["orphan.md"], f"unindexed note: {m['unindexed']}")
+        ok(m["broken_links"] == ["missing.md"], f"broken index link: {m['broken_links']}")
+        ok([x["file"] for x in m["frontmatter"]] == ["orphan.md"], f"frontmatter gap: {m['frontmatter']}")
+        ok(len(res["sections"]["due"]) == 1 and res["sections"]["due"][0]["date"] == "2026-11-05",
+           f"dated item: {res['sections']['due']}")
+        t = {i["name"]: i for i in res["sections"]["temp"]["items"]}
+        ok(t.get("fresh.txt", {}).get("owner") == "since-start", f"fresh temp path is this session's: {t}")
+        ok(t.get("old.txt", {}).get("owner") == "earlier", "old temp path is not claimed")
+        s = {i["name"]: i for i in res["sections"]["schedules"]["items"]}
+        ok(s.get("fresh.plist", {}).get("since_start") is True, f"fresh schedule flagged: {s}")
+        ok(s.get("old.plist", {}).get("since_start") is False, "old schedule not flagged")
+        r = res["sections"]["git"][0]
+        ok(r["untracked"] == ["untracked.txt"], f"untracked file: {r['untracked']}")
+        ok(res["attention"]["temp"] == 1 and res["attention"]["schedules"] == 1,
+           f"attention counts only this session's: {res['attention']}")
+
+        print("== state, brief, hook")
+        ok(os.path.isfile(state), "state file written to the path given")
+        rc, out, _ = checker("--config", cfg_path, "--brief", state=state)
+        ok(rc == 1 and "Still open from before" in out, f"brief calls known findings known: {out.strip()[:200]}")
+        rc, out, _ = checker("--config", cfg_path, "--hook", "--plugin", state=state)
+        ok(rc == 0 and out == "", "plugin hook silent until the installer opts in")
+        rc, out, _ = checker("--config", cfg_path, "--hook", state=state)
+        ok(rc == 0 and json.loads(out or "{}").get("systemMessage"), "hand-registered hook speaks")
+
+        print("== flags and discovery")
+        rc, out, _ = checker("--version")
+        ok(rc == 0 and out.startswith("wrapup-check "), f"--version: {out.strip()}")
+        rc, out, _ = checker("--config", cfg_path, "--show-config")
+        ok(rc == 0 and mem in out, "--show-config names the configured dir")
+        rc, out, _ = checker("--no-config", "--show-config")
+        ok(rc == 0 and "discovered" in out, f"--no-config discovers rather than reading a file (rc {rc})")
+        roots = [l for l in out.splitlines() if l.startswith("temp roots:")]
+        ok(bool(roots) and roots[0].strip() != "temp roots:", f"a temp root was discovered: {roots}")
+
+        print("== clean config")
+        clean = os.path.join(base, "clean.json")
+        write(clean, json.dumps({"memory_dirs": [], "repos": [], "temp": {"roots": []},
+                                 "schedules": {"dirs": [], "commands": False},
+                                 "processes": {"include": ["^$never"]}}))
+        rc, out, _ = checker("--config", clean, state=os.path.join(base, "s2.json"))
+        ok(rc == 0 and "All clear." in out, f"clean config exits 0 (rc {rc}; {out[-160:]})")
+
+        print("== process listing on this platform")
+        rc, out, _ = checker("--config", cfg_path, "--only", "processes", "--json",
+                             state=os.path.join(base, "s3.json"))
+        p = json.loads(out)["sections"]["processes"]
+        if p.get("error"):
+            ok(p.get("unsupported") is True,
+               f"a platform with no process list says so without failing: {p['error']}")
+        else:
+            ok(isinstance(p["items"], list), "process listing works")
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    print(f"\n{'FAILED: ' + str(len(FAILS)) if FAILS else 'all passed'}")
+    return 1 if FAILS else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

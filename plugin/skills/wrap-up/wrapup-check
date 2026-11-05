@@ -29,12 +29,22 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HERE = os.path.dirname(os.path.realpath(__file__))
 SECTIONS = ("memory", "due", "processes", "temp", "schedules", "git")
-SHELLS = re.compile(r"^(zsh|bash|sh|dash|fish|python3?(\.\d+)?|perl|node|nohup|timeout|caffeinate|sleep)$")
+SHELLS = re.compile(r"^(zsh|bash|sh|dash|fish|python3?(\.\d+)?(\.exe)?|perl|node(\.exe)?|nohup|timeout"
+                    r"|caffeinate|sleep|cmd(\.exe)?|powershell(\.exe)?|pwsh(\.exe)?)$", re.I)
 # mtime slack when deciding whether a path appeared after this session started
 SESSION_SLACK_S = 90
+WINDOWS = os.name == "nt"
+# A Claude process, by either path separator, with or without a Windows extension
+DEFAULT_CLAUDE_RE = (r"(^|[/\\])claude(\.exe|\.cmd|\.ps1)?(\s|$)"
+                     r"|[/\\]claude[/\\]versions[/\\][^/\\\s]+(\s|$)")
+
+
+def my_uid():
+    """None where the OS has no uid to compare against (Windows)."""
+    return os.getuid() if hasattr(os, "getuid") else None
 
 
 class ConfigError(Exception):
@@ -220,7 +230,8 @@ def _first_cwd(path):
                 except ValueError:
                     continue
                 c = row.get("cwd") if isinstance(row, dict) else None
-                if isinstance(c, str) and c.startswith("/"):
+                # POSIX /path or Windows C:\path — both appear in transcripts
+                if isinstance(c, str) and (c.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", c)):
                     return expand(c)
     except OSError:
         return None
@@ -287,12 +298,19 @@ def discover_repos(limit=40):
 
 
 def discover_temp_roots():
+    """/tmp where it exists, plus whatever the environment calls temp. macOS's
+    per-user /var/folders temp is left out: it is OS-managed, not session scratch."""
     roots = ["/tmp"] if os.path.isdir("/tmp") else []
-    t = os.environ.get("TMPDIR")
-    if t:
+    seen = {os.path.normcase(os.path.realpath(r)) for r in roots}
+    for var in ("TMPDIR", "TEMP", "TMP"):
+        t = os.environ.get(var)
+        if not t:
+            continue
         t = expand(t)
-        if os.path.isdir(t) and t not in roots and not t.startswith("/var/folders"):
+        key = os.path.normcase(os.path.realpath(t))
+        if os.path.isdir(t) and key not in seen and not t.startswith("/var/folders"):
             roots.append(t)
+            seen.add(key)
     return roots
 
 
@@ -574,8 +592,42 @@ def short_cmd(cmd, width=160):
     return cmd if len(cmd) <= width else cmd[:width - 1] + "…"
 
 
+PS_SCRIPT = (
+    "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object { "
+    "$a = 0; if ($_.CreationDate) { $a = [int]((Get-Date) - $_.CreationDate).TotalSeconds }; "
+    "'{0}|{1}|{2}|{3}' -f $_.ProcessId, $_.ParentProcessId, $a, "
+    "(($_.CommandLine, $_.Name -ne $null)[0] -replace '[\\r\\n]+', ' ') }"
+)
+
+
+def read_procs_windows():
+    """Windows has no ps. Win32_Process gives pid, parent, age and command line,
+    which is everything the ownership walk needs. Process owner is not read, so
+    owner_only has nothing to filter on and is ignored there."""
+    for shell in ("pwsh", "powershell"):
+        rc, out, err = run([shell, "-NoProfile", "-NonInteractive", "-Command", PS_SCRIPT], timeout=30)
+        if rc != 0:
+            continue
+        procs = {}
+        for line in out.splitlines():
+            parts = line.strip().split("|", 3)
+            if len(parts) < 4:
+                continue
+            try:
+                pid, ppid, age = int(parts[0]), int(parts[1]), int(parts[2])
+            except ValueError:
+                continue
+            procs[pid] = {"pid": pid, "ppid": ppid, "uid": None, "age_s": max(0, age),
+                          "cmd": parts[3].strip()}
+        if procs:
+            return procs, None
+    return {}, "no process list: neither pwsh nor powershell answered"
+
+
 def read_procs(cfg):
-    """One ps for every section that needs it. Returns (procs, error)."""
+    """One process listing for every section that needs it. Returns (procs, error)."""
+    if WINDOWS:
+        return read_procs_windows()
     rc, out, err = run(["ps", "-axww", "-o", "pid=,ppid=,uid=,etime=,command="])
     if rc != 0:
         return {}, f"ps failed: {err.strip() or rc}"
@@ -598,7 +650,7 @@ def session_info(procs, cfg):
     if not procs:
         return None, None
     claude_re = re.compile(cfg.get("processes", {}).get(
-        "claude", r"(^|/)claude(\s|$)|/claude/versions/[^/\s]+(\s|$)"))
+        "claude", DEFAULT_CLAUDE_RE))
 
     def is_claude(pid):
         return bool(claude_re.search(procs[pid]["cmd"].split(" -c ", 1)[0]))
@@ -628,10 +680,11 @@ def check_processes(cfg, procs, ps_error, current):
     pc = cfg.get("processes", {})
     include = [re.compile(p) for p in pc.get("include", DEFAULT_PROCESS_INCLUDE)]
     exclude = [re.compile(p) for p in pc.get("exclude", DEFAULT_PROCESS_EXCLUDE)]
-    claude_re = re.compile(pc.get("claude", r"(^|/)claude(\s|$)|/claude/versions/[^/\s]+(\s|$)"))
-    owner_only = pc.get("owner_only", True)
+    claude_re = re.compile(pc.get("claude", DEFAULT_CLAUDE_RE))
+    owner_only = pc.get("owner_only", True) and my_uid() is not None
     if ps_error:
-        return {"error": ps_error, "items": [], "current_session_pid": None}
+        return {"error": ps_error, "items": [], "current_session_pid": None,
+                "unsupported": WINDOWS}
 
     def chain(pid):
         seen, out_ = set(), []
@@ -647,7 +700,7 @@ def check_processes(cfg, procs, ps_error, current):
     my_chain = set(chain(os.getpid()))
     matched = set()
     for pid, p in procs.items():
-        if pid in my_chain or (owner_only and p["uid"] != os.getuid()) or is_claude(pid):
+        if pid in my_chain or (owner_only and p["uid"] != my_uid()) or is_claude(pid):
             continue
         text = p["cmd"]
         if any(r.search(text) for r in exclude):
@@ -724,7 +777,7 @@ def check_temp(cfg, session_age, sizes=True):
     roots = tc.get("roots", ["/tmp"])
     include = tc.get("include", ["*"])
     exclude = tc.get("exclude", DEFAULT_TEMP_EXCLUDE)
-    owner_only = tc.get("owner_only", True)
+    owner_only = tc.get("owner_only", True) and my_uid() is not None
     stale_h = float(tc.get("stale_hours", 24))
     now = time.time()
     budget = [int(tc.get("size_max_files", 200000)), time.monotonic() + float(tc.get("size_max_seconds", 8))]
@@ -747,7 +800,7 @@ def check_temp(cfg, session_age, sizes=True):
                 st = os.lstat(full)
             except OSError:
                 continue
-            if owner_only and st.st_uid != os.getuid():
+            if owner_only and st.st_uid != my_uid():
                 continue
             if stat.S_ISSOCK(st.st_mode) or stat.S_ISFIFO(st.st_mode):
                 continue
@@ -798,6 +851,19 @@ def check_schedules(cfg, session_age):
                     add("crontab", "crontab", line)
         elif rc not in (1, 127) and "no crontab" not in (err or "").lower():
             notes.append(f"crontab -l: {(err or '').strip()[:120]}")
+
+    if sc.get("commands", True) and WINDOWS:
+        import csv as _csv
+        rc, out, _ = run(["schtasks", "/query", "/fo", "csv", "/nh"], timeout=25)
+        if rc == 0:
+            for row in _csv.reader(out.splitlines()):
+                if not row or not row[0] or row[0].lower().startswith("taskname"):
+                    continue
+                # \Microsoft\... ships with Windows and is never session debris.
+                # schtasks reports no creation time, so these stay informational.
+                if row[0].lower().lstrip("\\").startswith("microsoft\\"):
+                    continue
+                add("schtasks", row[0], " ".join(row[1:3]).strip())
 
     dirs = sc.get("dirs")
     if dirs is None:
@@ -1112,7 +1178,7 @@ def build(cfg, sections, today, sizes):
         att["due"] = len(s["due"])
     if "processes" in s:
         att["processes"] = sum(1 for i in s["processes"]["items"] if i["owner"] in ("this-session", "orphan"))
-        if s["processes"].get("error"):
+        if s["processes"].get("error") and not s["processes"].get("unsupported"):
             att["processes"] += 1
     if "temp" in s:
         att["temp"] = sum(1 for i in s["temp"]["items"] if i.get("owner") == "since-start")
@@ -1181,7 +1247,9 @@ def human(res, show_temp):
         p = s["processes"]
         out.append(f"== Watcher-like processes (this session = claude pid {p.get('current_session_pid') or '?'})")
         if p.get("error"):
-            out.append(f"[!] {p['error']}")
+            out.append(f"[{'-' if p.get('unsupported') else '!'}] {p['error']}"
+                       + ("  (match leftover processes against your inventory by hand)"
+                          if p.get("unsupported") else ""))
         if not p["items"] and not p.get("error"):
             out.append("[ok] none")
         for i in p["items"]:

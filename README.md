@@ -58,8 +58,31 @@ cp -R claude-wrap-up/plugin/skills/wrap-up ~/.claude/skills/wrap-up
 ```
 
 Either way, start it with `/wrap-up`, or just say "wrap up" / "sign off" — the skill's description
-covers those. Requires `python3` and `git`. Developed on macOS, tested on macOS and Linux in CI;
-Windows is untested.
+covers those. Requires Python 3.8+ and `git`.
+
+## Platforms
+
+macOS, Linux and Windows. CI runs the full planted-fault suite on macOS and Linux, and a
+cross-platform smoke test on all three, plus the Windows launcher under `cmd.exe` and the script's
+own shebang under Git Bash.
+
+On Windows, Claude Code runs commands and hooks through **Git Bash**, where the script works as it
+does anywhere else. From PowerShell or `cmd` there is no shebang, so use `wrapup-check.cmd` beside
+it: it runs each of `py -3`, `python` and `python3` rather than trusting the name, because on a
+Windows machine without Python those names are the Microsoft Store's install prompt.
+
+Two things differ there, both reported rather than silently wrong:
+
+- **Processes** come from `Win32_Process` over PowerShell instead of `ps`. The ownership walk is the
+  same; process owner isn't read, so `owner_only` has nothing to filter on. If neither `pwsh` nor
+  `powershell` answers, the section says so and does not claim the machine is clean.
+- **Schedules** add Windows Scheduled Tasks via `schtasks`, skipping the `\Microsoft\` tree that
+  ships with Windows. `schtasks` reports no creation time, so those entries are listed for you to
+  match rather than flagged as this session's.
+
+The session-start notice is the one part that needs Git Bash: the hook a plugin registers is a
+POSIX command, so without Git Bash it does nothing. Point a hand-written hook at `wrapup-check.cmd`
+instead if you want the notice under PowerShell.
 
 ## Configuration: usually none
 

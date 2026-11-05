@@ -17,7 +17,12 @@ Next to this file:
 - `config.example.json`: every setting, with what it is for. Copy it only to change a default.
 - `tests/run-tests`: planted-fault tests. Run them after changing the checker.
 
-Run it as `${CLAUDE_SKILL_DIR}/wrapup-check`.
+Run it as `${CLAUDE_SKILL_DIR}/wrapup-check`. On Windows that works from Git Bash, which is the shell
+Claude Code runs commands through; from PowerShell or `cmd`, use `wrapup-check.cmd` beside it, which
+finds a Python itself. If neither runs, fall back to `python "${CLAUDE_SKILL_DIR}/wrapup-check"`.
+
+Where the platform has no process list, the processes section says so instead of reporting none —
+read that as "match leftover processes by hand", not as "nothing is running".
 
 ## Configuration: usually none
 

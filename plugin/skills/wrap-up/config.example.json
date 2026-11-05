@@ -75,7 +75,7 @@
     "size_max_seconds": 8
   },
 
-  "_schedules": "Things that run again without anyone starting them. With no config the checker reads `crontab -l`, ~/Library/LaunchAgents, ~/.config/systemd/user, `systemctl --user list-timers` and <claude dir>/scheduled-tasks. Only entries created during the current session are flagged; everything else is listed so you can match it against your inventory. dirs replaces that list; commands:false stops it running crontab/systemctl; include promotes anything matching to flagged; exclude hides permanent third-party entries that are never session debris.",
+  "_schedules": "Things that run again without anyone starting them. With no config the checker reads `crontab -l`, ~/Library/LaunchAgents, ~/.config/systemd/user, `systemctl --user list-timers`, `schtasks /query` on Windows (minus the \\Microsoft\\ tree) and <claude dir>/scheduled-tasks. Only entries created during the current session are flagged; everything else is listed so you can match it against your inventory. dirs replaces that list; commands:false stops it running crontab/systemctl; include promotes anything matching to flagged; exclude hides permanent third-party entries that are never session debris.",
   "schedules": {
     "commands": true,
     "exclude": ["com\\.apple\\.", "com\\.google\\."],

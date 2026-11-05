@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.1.0 — 2026-11-05
+
+Windows support, tested on a real Windows 11 box (PowerShell 5.1, Python 3.14, Git 2.56) and in CI
+on `windows-latest`.
+
+### Added
+
+- `wrapup-check.cmd`, for PowerShell and `cmd`, which have no shebang. It runs each of `py -3`,
+  `python` and `python3` rather than trusting the name: on a Windows machine without Python those
+  names resolve to the Microsoft Store's install prompt. Exit codes pass through unchanged.
+- Processes on Windows come from `Win32_Process` over PowerShell. The ownership walk — which Claude
+  session owns a watcher — works the same; process owner isn't read, so `owner_only` is ignored
+  there. A platform with no process list now says so and is not counted as attention, instead of
+  reporting an empty list that reads as "nothing is running".
+- Windows Scheduled Tasks in the schedules section via `schtasks`, skipping the `\Microsoft\` tree.
+- `tests/smoke`: a cross-platform test of config, discovery, every section, exit codes and the state
+  file, using only Python, git and the filesystem. CI runs it on Linux, macOS and Windows, plus the
+  `.cmd` launcher under `cmd.exe` and the shebang under Git Bash.
+
+### Fixed
+
+- `os.getuid()` does not exist on Windows, so the temp and process sections raised `AttributeError`
+  there. Owner filtering is now skipped where the OS has no uid to compare.
+- Repository discovery read only POSIX working directories from transcripts, so it found nothing on
+  Windows. `C:\...` paths are now recognised.
+- Temp roots are discovered from `TEMP` and `TMP` as well as `TMPDIR`, so Windows has one.
+- A Claude process is matched with either path separator and a `.exe`/`.cmd`/`.ps1` suffix.
+
 ## 1.0.0 — 2026-11-05
 
 First public release. The skill and its checker had been in daily private use since 2026-10-30; this

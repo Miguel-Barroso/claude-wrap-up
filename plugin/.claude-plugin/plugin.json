@@ -1,7 +1,7 @@
 {
   "name": "wrap-up",
   "displayName": "Wrap-up",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "End-of-session pass: consolidate memory into current-state notes, then clean up only this session's own debris and report what is still open.",
   "author": { "name": "Miguel Barroso" },
   "homepage": "https://github.com/Miguel-Barroso/claude-wrap-up",
