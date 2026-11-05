@@ -171,6 +171,17 @@ def main():
               json.dumps({"type": "user", "cwd": repo, "timestamp": "2026-10-31T00:00:00Z"}) + "\n")
         write(f"{home}/.claude/projects/-no-memory-here/session.jsonl",
               json.dumps({"type": "user", "cwd": clean_repo}) + "\n")
+        # A project whose transcripts are gone: only its directory name says what it
+        # was for. The repo name carries hyphens, so decoding it is ambiguous and has
+        # to be settled against the filesystem.
+        slug_repo = os.path.join(base, "slug-only-repo")
+        sh("git", "init", "-q", "-b", "main", slug_repo)
+        write(f"{slug_repo}/f.txt", "1\n")
+        sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+           "-C", slug_repo, "add", "f.txt")
+        sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+           "-C", slug_repo, "commit", "-q", "-m", "one")
+        os.makedirs(os.path.join(home, ".claude", "projects", slug_repo.replace(os.sep, "-")))
         write(f"{home}/.ssh/config",
               "Host planted-one\n  HostName 10.0.0.1\n\nHost *\n  ServerAliveInterval 30\n\n"
               "Host planted-two planted-three\n  User x\n")
@@ -350,6 +361,7 @@ def main():
         ok("memory_dirs" in out and "project" in out and f"{home}/.claude/projects/{slug}/memory" in out,
            f"discovers a project memory dir: {out[:400]}")
         ok(repo in out, "discovers a repo from the transcript's recorded cwd")
+        ok(slug_repo in out, f"decodes a transcript-less project's name back to its repo: {out[-500:]}")
         ok(clean_repo not in out.split("remote hosts")[0] or True, "a project without memory still contributes its repo")
         ok("planted-one" in out and "planted-two" in out and "planted-three" in out,
            f"discovers ssh-config hosts: {out[-400:]}")

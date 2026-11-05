@@ -29,7 +29,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 HERE = os.path.dirname(os.path.realpath(__file__))
 SECTIONS = ("memory", "due", "processes", "temp", "schedules", "git")
 SHELLS = re.compile(r"^(zsh|bash|sh|dash|fish|python3?(\.\d+)?(\.exe)?|perl|node(\.exe)?|nohup|timeout"
@@ -256,6 +256,41 @@ def _newest_transcript(d):
     return best, when
 
 
+def _decode_slug(slug, budget=None):
+    """A project directory is named after its working directory with the path
+    separators replaced by '-', which is lossy: real directory names contain
+    hyphens too. So read each hyphen both ways and let the filesystem decide,
+    keeping only a path that exists and is a main git checkout. Used when a
+    project has no transcript left to read a working directory from.
+
+    Windows slugs (C--Users-me-code) are not decodable this way and return None."""
+    if budget is None:
+        budget = [400]
+    parts = [p for p in slug.lstrip("-").split("-") if p]
+    if not parts or len(parts) > 24:
+        return None
+
+    def walk(base, i):
+        if budget[0] <= 0:
+            return None
+        if i >= len(parts):
+            return base if os.path.isdir(os.path.join(base, ".git")) else None
+        # Prefer the longest directory name that exists, so "estate-hosting"
+        # is tried before "estate" when both could match.
+        for k in range(len(parts) - i, 0, -1):
+            budget[0] -= 1
+            if budget[0] <= 0:
+                return None
+            cand = os.path.join(base, "-".join(parts[i:i + k]))
+            if os.path.isdir(cand):
+                got = walk(cand, i + k)
+                if got:
+                    return got
+        return None
+
+    return walk(os.sep, 0)
+
+
 def discover_repos(limit=40):
     """Main checkouts: the cwd of each project's newest transcript, plus the
     repo the checker is run from. A .git directory (not a .git file) keeps
@@ -280,9 +315,16 @@ def discover_repos(limit=40):
         if not os.path.isdir(proj):
             continue
         tr, when = _newest_transcript(proj)
-        if not tr:
-            continue
-        cwd = _first_cwd(tr)
+        cwd = _first_cwd(tr) if tr else None
+        if not cwd:
+            # No transcript, or none that recorded a working directory: fall back
+            # to the directory name, which encodes the path it was made for.
+            cwd = _decode_slug(slug)
+            if cwd:
+                try:
+                    when = os.path.getmtime(proj)
+                except OSError:
+                    when = 0.0
         if cwd and os.path.isdir(os.path.join(cwd, ".git")):
             cands.append((when, cwd))
     out, seen = [], set()

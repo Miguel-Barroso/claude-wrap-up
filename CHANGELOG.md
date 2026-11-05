@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.0 — 2026-11-05
+
+### Added
+
+- Repository discovery falls back to the project directory's own name when a project has no
+  transcript left to read a working directory from. The name is the working directory with its path
+  separators replaced by `-`, which is lossy because real directory names contain hyphens too, so
+  each hyphen is read both ways and the filesystem settles it: a candidate counts only if it exists
+  and is a main git checkout. Found on a WSL2 install whose project directories held memory but no
+  transcripts, where discovery had reported no repositories at all.
+
 ## 1.1.0 — 2026-11-05
 
 Windows support, tested on a real Windows 11 box (PowerShell 5.1, Python 3.14, Git 2.56) and in CI
