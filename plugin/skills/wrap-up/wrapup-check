@@ -1,0 +1,1516 @@
+#!/usr/bin/env -S python3 -I
+"""wrapup-check: read-only end-of-session checker for the wrap-up skill.
+
+Reports memory-index problems, dated memory items coming due, leftover watcher
+processes, temp paths, leftover schedules and git repo state.
+
+It never modifies anything it checks: git runs with optional locks off and
+nothing is fetched, and remote checks (--remote) run only the commands listed
+in the config, which are echoed before they run. The one file it writes is its
+own run state (--state), so a later --brief can tell a new finding from one you
+have already seen.
+
+With no config it discovers what to check: memory directories under the Claude
+config dir, repositories from the recorded working directory of each project's
+newest transcript, and the temp roots from the environment. A config overrides
+discovery per key.
+
+Exit: 0 nothing needs attention, 1 something does, 2 usage or config error.
+--hook always exits 0 and prints nothing when there is nothing to report.
+"""
+import argparse
+import datetime as dt
+import fnmatch
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+
+VERSION = "1.0.0"
+HERE = os.path.dirname(os.path.realpath(__file__))
+SECTIONS = ("memory", "due", "processes", "temp", "schedules", "git")
+SHELLS = re.compile(r"^(zsh|bash|sh|dash|fish|python3?(\.\d+)?|perl|node|nohup|timeout|caffeinate|sleep)$")
+# mtime slack when deciding whether a path appeared after this session started
+SESSION_SLACK_S = 90
+
+
+class ConfigError(Exception):
+    pass
+
+
+# ---------- helpers ----------
+
+def expand(p):
+    return os.path.normpath(os.path.expanduser(os.path.expandvars(p)))
+
+
+def claude_dir():
+    return expand(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
+
+
+def under(path, parent):
+    path, parent = os.path.realpath(path), os.path.realpath(parent)
+    return path == parent or path.startswith(parent + os.sep)
+
+
+def fmt_age(seconds):
+    s = max(0, int(seconds))
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s / 3600:.1f}h"
+    return f"{s / 86400:.1f}d"
+
+
+def fmt_size(n):
+    for unit in ("B", "K", "M", "G"):
+        if n < 1024 or unit == "G":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+
+
+def plural(n, word, many=None):
+    return f"{n} {word if n == 1 else (many or word + 's')}"
+
+
+def run(cmd, timeout=15, cwd=None, env=None):
+    """Run a command, return (rc, stdout, stderr). Never raises on failure."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           cwd=cwd, env=env, stdin=subprocess.DEVNULL)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timed out after {timeout}s"
+    except OSError as e:
+        return 127, "", str(e)
+
+
+# ---------- config and discovery ----------
+
+DEFAULT_LIMITS = {"lines": 200, "bytes": 25000, "warn_ratio": 0.8}
+
+DEFAULT_TEMP_EXCLUDE = [
+    ".*", "claude-*", "tmux-*", "com.apple.*", "powerlog", "*.sock", "*-unix",
+    "systemd-private-*", "snap-private-tmp", "*AppTranslocation*",
+]
+
+DEFAULT_PROCESS_INCLUDE = [
+    r"\bnohup\b",
+    r"[_-]watch(?:er)?\b",
+    r"\bwatch(?:er)?\.(?:sh|py)\b",
+    r"\bpoll(?:er|ing)?(?:\.sh|\.py)?\b",
+    r"\buntil\b[^⏎]*\bsleep \d",
+    r"\bwhile\b[^⏎]*\bsleep \d",
+    r"\btail -[fF]\b",
+    r"\bfswatch\b",
+    r"\bgh (?:run watch|pr checks\b.*--watch)",
+]
+
+DEFAULT_PROCESS_EXCLUDE = [
+    r"^/(?:System|Applications|usr/libexec|usr/sbin|Library)/",
+]
+
+
+def config_candidates(explicit):
+    if explicit:
+        return [expand(explicit)]
+    out = []
+    env = os.environ.get("WRAPUP_CONFIG")
+    if env:
+        out.append(expand(env))
+    out.append(os.path.join(claude_dir(), "wrap-up", "config.json"))
+    out.append(os.path.join(HERE, "config.json"))
+    return out
+
+
+def load_config(explicit):
+    """Read the first config that exists, then fill unset keys by discovery."""
+    cands = config_candidates(explicit)
+    path, cfg = None, {}
+    for c in cands:
+        if os.path.isfile(c):
+            path = c
+            break
+    if path is None and explicit:
+        raise ConfigError(f"config not found: {cands[0]}")
+    if path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ConfigError(f"config is not valid JSON: {path}: {e}")
+        except OSError as e:
+            raise ConfigError(f"cannot read config: {path}: {e}")
+        if not isinstance(cfg, dict):
+            raise ConfigError("config must be a JSON object")
+    for d in cfg.get("memory_dirs", []):
+        if not isinstance(d, dict) or "path" not in d:
+            raise ConfigError(f"memory_dirs entry without path: {d}")
+    try:
+        for key in ("include", "exclude"):
+            for pat in cfg.get("processes", {}).get(key, []):
+                re.compile(pat)
+            for pat in cfg.get("schedules", {}).get(key, []):
+                re.compile(pat)
+        due = cfg.get("due", {})
+        for kw in due.get("keywords", []):
+            re.compile(kw)
+        if due.get("ignore_line"):
+            re.compile(due["ignore_line"])
+    except re.error as e:
+        raise ConfigError(f"bad regex in config: {e}")
+    cfg["_config_path"] = path
+    return discover(cfg)
+
+
+def slug_label(slug, taken):
+    parts = [p for p in slug.lstrip("-").split("-") if p]
+    label = parts[-1] if parts else slug
+    if label in taken and len(parts) > 1:
+        label = "-".join(parts[-2:])
+    n, base = 2, label
+    while label in taken:
+        label, n = f"{base}-{n}", n + 1
+    taken.add(label)
+    return label
+
+
+def discover_memory_dirs():
+    """Every <claude dir>/projects/*/memory that holds notes."""
+    base = os.path.join(claude_dir(), "projects")
+    out, taken = [], set()
+    try:
+        slugs = sorted(os.listdir(base))
+    except OSError:
+        return out
+    for slug in slugs:
+        path = os.path.join(base, slug, "memory")
+        if not os.path.isdir(path):
+            continue
+        try:
+            names = os.listdir(path)
+        except OSError:
+            continue
+        notes = [n for n in names if n.endswith(".md")]
+        if not notes:
+            continue
+        index = None
+        for cand in ("MEMORY.md", "INDEX.md"):
+            if cand in names:
+                index = cand
+                break
+        out.append({"label": slug_label(slug, taken), "path": path,
+                    "index": index, "discovered": True})
+    return out
+
+
+def _first_cwd(path):
+    """The cwd recorded in a transcript's first rows."""
+    try:
+        with open(path, "rb") as fh:
+            for _ in range(3):
+                line = fh.readline(1 << 16)
+                if not line:
+                    return None
+                try:
+                    row = json.loads(line.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                c = row.get("cwd") if isinstance(row, dict) else None
+                if isinstance(c, str) and c.startswith("/"):
+                    return expand(c)
+    except OSError:
+        return None
+    return None
+
+
+def _newest_transcript(d):
+    best, when = None, -1.0
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                if not e.name.endswith(".jsonl"):
+                    continue
+                try:
+                    t = e.stat().st_mtime
+                except OSError:
+                    continue
+                if t > when:
+                    best, when = e.path, t
+    except OSError:
+        pass
+    return best, when
+
+
+def discover_repos(limit=40):
+    """Main checkouts: the cwd of each project's newest transcript, plus the
+    repo the checker is run from. A .git directory (not a .git file) keeps
+    worktrees and submodules out; the git section lists those per repo."""
+    cands = []
+    p = os.getcwd()
+    while True:
+        if os.path.isdir(os.path.join(p, ".git")):
+            cands.append((time.time(), p))
+            break
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    base = os.path.join(claude_dir(), "projects")
+    try:
+        slugs = os.listdir(base)
+    except OSError:
+        slugs = []
+    for slug in slugs:
+        proj = os.path.join(base, slug)
+        if not os.path.isdir(proj):
+            continue
+        tr, when = _newest_transcript(proj)
+        if not tr:
+            continue
+        cwd = _first_cwd(tr)
+        if cwd and os.path.isdir(os.path.join(cwd, ".git")):
+            cands.append((when, cwd))
+    out, seen = [], set()
+    for _, path in sorted(cands, key=lambda x: -x[0]):
+        real = os.path.realpath(path)
+        if real in seen:
+            continue
+        seen.add(real)
+        out.append(path)
+        if len(out) >= limit:
+            break
+    return sorted(out)
+
+
+def discover_temp_roots():
+    roots = ["/tmp"] if os.path.isdir("/tmp") else []
+    t = os.environ.get("TMPDIR")
+    if t:
+        t = expand(t)
+        if os.path.isdir(t) and t not in roots and not t.startswith("/var/folders"):
+            roots.append(t)
+    return roots
+
+
+def discover(cfg):
+    found = []
+    if "memory_dirs" not in cfg:
+        cfg["memory_dirs"] = discover_memory_dirs()
+        found.append("memory_dirs")
+    if "repos" not in cfg:
+        cfg["repos"] = discover_repos()
+        found.append("repos")
+    temp = cfg.setdefault("temp", {})
+    if "roots" not in temp:
+        temp["roots"] = discover_temp_roots()
+        found.append("temp.roots")
+    cfg["_discovered"] = found
+    return cfg
+
+
+def memory_dirs(cfg):
+    """Normalized memory-directory specs."""
+    default_index = cfg.get("memory_index", "MEMORY.md")
+    out, taken = [], set()
+    for d in cfg.get("memory_dirs", []):
+        d = dict(d)
+        d["path"] = path = expand(d["path"])
+        label = d.get("label") or os.path.basename(os.path.dirname(path)) or path
+        n, base = 2, label
+        while label in taken:
+            label, n = f"{base}-{n}", n + 1
+        taken.add(label)
+        d["label"] = label
+        if "index" not in d:
+            d["index"] = default_index
+        d.setdefault("discovered", False)
+        d.setdefault("recursive", False)
+        d.setdefault("require_frontmatter", True)
+        d.setdefault("include", ["*.md"])
+        d.setdefault("exclude", [])
+        if "index_limits" not in d:
+            # The limit is about an index that loads into context at session start.
+            # A dir that overrides `index` points at something else — a repo's own
+            # index, read on demand — so no limit applies there.
+            d["index_limits"] = cfg.get("index_limits", DEFAULT_LIMITS) \
+                if d["index"] == default_index else False
+        d.setdefault("types", cfg.get("memory_types", ["user", "feedback", "project", "reference"]))
+        out.append(d)
+    return out
+
+
+# ---------- memory ----------
+
+FM_RE = re.compile(r"\A---\n(.*?)\n---[ \t]*(?:\n|\Z)", re.S)
+LINK_RE = re.compile(r"\]\(\s*<?([^)\s>]+)>?\s*\)")
+
+
+def parse_frontmatter(text):
+    """Minimal parser for the flat frontmatter these notes use: top-level keys
+    plus one level of nesting (metadata.type). Returns dict or None."""
+    m = FM_RE.match(text)
+    if not m:
+        return None
+    out, parent = {}, None
+    for line in m.group(1).split("\n"):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        km = re.match(r"^(\s*)([A-Za-z_][\w-]*):\s*(.*)$", line)
+        if not km:
+            continue
+        indent, key, val = km.groups()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        if not indent:
+            out[key] = val
+            parent = key if val == "" else None
+            if parent:
+                out[key] = {}
+        elif parent and isinstance(out.get(parent), dict):
+            out[parent][key] = val
+    return out
+
+
+def _matches(rel, globs):
+    return any(fnmatch.fnmatchcase(rel, g) or fnmatch.fnmatchcase(os.path.basename(rel), g)
+               for g in globs)
+
+
+def note_files(spec, index_name):
+    """Markdown files in a memory directory, as paths relative to it."""
+    path, out = spec["path"], []
+    if spec["recursive"]:
+        for root, dirs, files in os.walk(path):
+            dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+            for f in sorted(files):
+                if f.endswith(".md"):
+                    out.append(os.path.relpath(os.path.join(root, f), path))
+    else:
+        try:
+            out = sorted(f for f in os.listdir(path)
+                         if f.endswith(".md") and os.path.isfile(os.path.join(path, f)))
+        except OSError:
+            return []
+    return [f for f in out if f != index_name
+            and _matches(f, spec["include"]) and not _matches(f, spec["exclude"])]
+
+
+def check_memory(cfg):
+    results = []
+    for spec in memory_dirs(cfg):
+        path, index_name = spec["path"], spec["index"]
+        r = {"label": spec["label"], "path": path, "exists": os.path.isdir(path),
+             "rules": spec.get("rules"), "broken_links": [], "unindexed": [],
+             "frontmatter": [], "duplicate_names": [], "index": None,
+             "index_name": index_name, "files": 0, "no_index": False}
+        results.append(r)
+        if not r["exists"]:
+            r["error"] = "directory missing"
+            continue
+        files = note_files(spec, index_name)
+        r["files"] = len(files)
+        idx_path = os.path.join(path, index_name) if index_name else None
+        if not index_name or not os.path.isfile(idx_path):
+            if spec["discovered"] or not index_name:
+                # Nothing to check against, and no convention was declared.
+                r["no_index"] = True
+                continue
+            r["error"] = f"{index_name} missing"
+            r["unindexed"] = files
+            continue
+        with open(idx_path, "rb") as f:
+            raw = f.read()
+        text = raw.decode("utf-8", errors="replace")
+        lim = spec["index_limits"]
+        if lim:
+            n_lines = text.count("\n") + (0 if text.endswith("\n") or not text else 1)
+            max_lines = lim.get("lines", 200)
+            max_bytes = lim.get("bytes", 25000)
+            ratio = lim.get("warn_ratio", 0.8)
+            r["index"] = {
+                "lines": n_lines, "bytes": len(raw),
+                "max_lines": max_lines, "max_bytes": max_bytes, "limited": True,
+                "over": n_lines > max_lines or len(raw) > max_bytes,
+                "warn": n_lines >= max_lines * ratio or len(raw) >= max_bytes * ratio,
+            }
+        else:
+            r["index"] = {"lines": text.count("\n"), "bytes": len(raw), "limited": False,
+                          "over": False, "warn": False}
+        linked = set()
+        for target in LINK_RE.findall(text):
+            if re.match(r"^[a-z][a-z0-9+.-]*:", target, re.I):  # http:, mailto:, ...
+                continue
+            target = target.split("#", 1)[0]
+            if not target or not target.endswith(".md"):
+                continue
+            full = os.path.normpath(os.path.join(path, target))
+            if under(full, path) and os.path.isfile(full):
+                linked.add(os.path.relpath(full, path))
+            if not os.path.isfile(full) and target not in r["broken_links"]:
+                r["broken_links"].append(target)
+        r["unindexed"] = [f for f in files if f not in linked]
+        names = {}
+        for f in files:
+            if not spec["require_frontmatter"]:
+                continue
+            with open(os.path.join(path, f), encoding="utf-8", errors="replace") as fh:
+                fm = parse_frontmatter(fh.read(8192))
+            problems = []
+            if fm is None:
+                problems.append("no frontmatter")
+            else:
+                for key in ("name", "description"):
+                    if not fm.get(key) or isinstance(fm.get(key), dict):
+                        problems.append(f"missing {key}")
+                meta = fm.get("metadata")
+                mtype = meta.get("type") if isinstance(meta, dict) else None
+                if not mtype:
+                    problems.append("missing metadata.type" + (" (type is top-level)" if fm.get("type") else ""))
+                elif mtype not in set(spec["types"]):
+                    problems.append(f"metadata.type '{mtype}' not in {sorted(spec['types'])}")
+                if isinstance(fm.get("name"), str) and fm.get("name"):
+                    names.setdefault(fm["name"], []).append(f)
+            if problems:
+                r["frontmatter"].append({"file": f, "problems": problems})
+        r["duplicate_names"] = [{"name": n, "files": fs} for n, fs in sorted(names.items()) if len(fs) > 1]
+    return results
+
+
+def memory_attention(r):
+    return bool(r.get("error") or r["broken_links"] or r["unindexed"] or r["frontmatter"]
+                or r["duplicate_names"] or (r["index"] and r["index"]["warn"]))
+
+
+# ---------- dated items ----------
+
+DEFAULT_DUE = {
+    "window_days": 14,
+    "lookback_days": 30,
+    "max_gap_chars": 30,
+    "keywords": [r"EXPIR(?:E|ES|Y|ING)", r"delete after", r"remove after", r"checkpoint",
+                 r"renew(?:al)?(?: it)? (?:before|by)", r"due(?: on| by)?", r"deadline"],
+    "ignore_line": r"✅|~~",
+}
+
+
+def check_due(cfg, today):
+    due = {**DEFAULT_DUE, **cfg.get("due", {})}
+    kw = "|".join(f"(?:{k})" for k in due["keywords"])
+    # The gap may not cross a sentence end, so a keyword never pairs with the next sentence's date.
+    pat = re.compile(rf"(?i)\b(?P<kw>{kw})\b[^\n.;!?]{{0,{int(due['max_gap_chars'])}}}?\b(?P<date>20\d\d-[01]\d-[0-3]\d)\b")
+    ignore = re.compile(due["ignore_line"]) if due.get("ignore_line") else None
+    window, lookback = int(due["window_days"]), int(due["lookback_days"])
+    items = []
+    for spec in memory_dirs(cfg):
+        path, index_name = spec["path"], spec["index"]
+        if not os.path.isdir(path):
+            continue
+        files = note_files(spec, index_name)
+        if index_name and os.path.isfile(os.path.join(path, index_name)):
+            files.append(index_name)  # index last, so its duplicates can be dropped
+        seen_dates = set()
+        for f in files:
+            try:
+                with open(os.path.join(path, f), encoding="utf-8", errors="replace") as fh:
+                    lines = fh.read().split("\n")
+            except OSError:
+                continue
+            for n, line in enumerate(lines, 1):
+                if ignore and ignore.search(line):
+                    continue
+                for m in pat.finditer(line):
+                    try:
+                        when = dt.date.fromisoformat(m.group("date"))
+                    except ValueError:
+                        continue
+                    days = (when - today).days
+                    if days > window or days < -lookback:
+                        continue
+                    if f == index_name and m.group("date") in seen_dates:
+                        continue
+                    seen_dates.add(m.group("date"))
+                    s = max(0, m.start() - 60)
+                    snippet = line[s:m.end() + 80].strip()
+                    items.append({"label": spec["label"], "file": f, "path": os.path.join(path, f),
+                                  "line": n, "keyword": m.group("kw"), "date": m.group("date"),
+                                  "days": days, "text": ("…" if s else "") + snippet})
+    items.sort(key=lambda i: i["days"])
+    return items
+
+
+def due_word(days):
+    if days < 0:
+        return f"overdue {-days}d"
+    if days == 0:
+        return "due today"
+    return f"due in {days}d"
+
+
+# ---------- processes ----------
+
+def parse_etime(s):
+    days = 0
+    if "-" in s:
+        d, s = s.split("-", 1)
+        days = int(d)
+    parts = [int(x) for x in s.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    h, m, sec = parts
+    return days * 86400 + h * 3600 + m * 60 + sec
+
+
+def short_cmd(cmd, width=160):
+    """Claude Code's Bash tool wraps commands in `zsh -c source <snapshot> ... eval '<cmd>'`;
+    show the eval'd command instead of the preamble."""
+    if "shell-snapshots/snapshot-" in cmd and "eval '" in cmd:
+        cmd = "[bash tool] " + cmd.split("eval '", 1)[1]
+    cmd = cmd.replace("\\012", " ⏎ ")
+    return cmd if len(cmd) <= width else cmd[:width - 1] + "…"
+
+
+def read_procs(cfg):
+    """One ps for every section that needs it. Returns (procs, error)."""
+    rc, out, err = run(["ps", "-axww", "-o", "pid=,ppid=,uid=,etime=,command="])
+    if rc != 0:
+        return {}, f"ps failed: {err.strip() or rc}"
+    procs = {}
+    for line in out.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) < 5:
+            continue
+        try:
+            pid, ppid, uid = int(parts[0]), int(parts[1]), int(parts[2])
+            age = parse_etime(parts[3])
+        except ValueError:
+            continue
+        procs[pid] = {"pid": pid, "ppid": ppid, "uid": uid, "age_s": age, "cmd": parts[4]}
+    return procs, None
+
+
+def session_info(procs, cfg):
+    """(claude pid of this session, its age in seconds). Either may be None."""
+    if not procs:
+        return None, None
+    claude_re = re.compile(cfg.get("processes", {}).get(
+        "claude", r"(^|/)claude(\s|$)|/claude/versions/[^/\s]+(\s|$)"))
+
+    def is_claude(pid):
+        return bool(claude_re.search(procs[pid]["cmd"].split(" -c ", 1)[0]))
+
+    def chain(pid):
+        seen, out = set(), []
+        while pid in procs and pid not in seen and pid > 1:
+            seen.add(pid)
+            out.append(pid)
+            pid = procs[pid]["ppid"]
+        return out
+
+    env_pid = os.environ.get("CLAUDE_PID", "")
+    current = None
+    if env_pid.isdigit() and int(env_pid) in procs and is_claude(int(env_pid)):
+        current = int(env_pid)
+    else:
+        current = next((p for p in chain(os.getpid()) if is_claude(p)), None)
+    age = procs[current]["age_s"] if current in procs else None
+    forced = os.environ.get("WRAPUP_SESSION_AGE")  # tests pin the age; pid detection is unchanged
+    if forced and forced.strip().isdigit():
+        age = int(forced)
+    return current, age
+
+
+def check_processes(cfg, procs, ps_error, current):
+    pc = cfg.get("processes", {})
+    include = [re.compile(p) for p in pc.get("include", DEFAULT_PROCESS_INCLUDE)]
+    exclude = [re.compile(p) for p in pc.get("exclude", DEFAULT_PROCESS_EXCLUDE)]
+    claude_re = re.compile(pc.get("claude", r"(^|/)claude(\s|$)|/claude/versions/[^/\s]+(\s|$)"))
+    owner_only = pc.get("owner_only", True)
+    if ps_error:
+        return {"error": ps_error, "items": [], "current_session_pid": None}
+
+    def chain(pid):
+        seen, out_ = set(), []
+        while pid in procs and pid not in seen and pid > 1:
+            seen.add(pid)
+            out_.append(pid)
+            pid = procs[pid]["ppid"]
+        return out_
+
+    def is_claude(pid):
+        return bool(claude_re.search(procs[pid]["cmd"].split(" -c ", 1)[0]))
+
+    my_chain = set(chain(os.getpid()))
+    matched = set()
+    for pid, p in procs.items():
+        if pid in my_chain or (owner_only and p["uid"] != os.getuid()) or is_claude(pid):
+            continue
+        text = p["cmd"]
+        if any(r.search(text) for r in exclude):
+            continue
+        if any(r.search(text) for r in include):
+            matched.add(pid)
+
+    items = []
+    for pid in matched:
+        anc = chain(pid)[1:]
+        if any(a in matched for a in anc):  # report the outermost matching process only
+            continue
+        owner_pid = next((a for a in anc if is_claude(a)), None)
+        if owner_pid is not None:
+            owner = "this-session" if owner_pid == current else "other-session"
+        else:
+            top = (chain(pid) or [pid])[-1]
+            argv0 = procs[top]["cmd"].split()[0].lstrip("-")
+            owner = "orphan" if (top == pid or SHELLS.match(os.path.basename(argv0))) else "outside-claude"
+        p = procs[pid]
+        items.append({"pid": pid, "ppid": p["ppid"], "age_s": p["age_s"], "age": fmt_age(p["age_s"]),
+                      "owner": owner, "session_pid": owner_pid, "command": short_cmd(p["cmd"])})
+    order = {"this-session": 0, "orphan": 1, "outside-claude": 2, "other-session": 3}
+    items.sort(key=lambda i: (order[i["owner"]], -i["age_s"]))
+    return {"current_session_pid": current, "items": items}
+
+
+# ---------- temp paths ----------
+
+def tree_size(path, budget):
+    """Sum of file sizes under path. budget = [files_left, deadline]; returns (bytes, complete)."""
+    total, complete = 0, True
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return 0, True
+    if not stat.S_ISDIR(st.st_mode):
+        return st.st_size, True
+    stack = [path]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for e in it:
+                    budget[0] -= 1
+                    if budget[0] <= 0 or time.monotonic() > budget[1]:
+                        return total, False
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        else:
+                            total += e.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        complete = False
+        except OSError:
+            complete = False
+    return total, complete
+
+
+EXTENSIONS = {"json", "jsonl", "html", "yaml", "toml", "conf", "diff", "patch", "docx", "xlsx", "pptx",
+              "jpeg", "heic", "webp", "tiff", "flac", "part", "lock", "plist", "ipynb", "sqlite", "back"}
+
+
+def group_key(name):
+    """Display grouping only: mktemp-style random suffixes become *, digit runs become #."""
+    m = re.search(r"([._-])([A-Za-z0-9]{4,8})$", name)
+    if m and m.group(2).lower() not in EXTENSIONS and not (m.group(1) == "-" and m.group(2).isdigit()):
+        name = name[:m.start()] + m.group(1) + "*"
+    return re.sub(r"\d+", "#", name)
+
+
+def check_temp(cfg, session_age, sizes=True):
+    tc = cfg.get("temp", {})
+    roots = tc.get("roots", ["/tmp"])
+    include = tc.get("include", ["*"])
+    exclude = tc.get("exclude", DEFAULT_TEMP_EXCLUDE)
+    owner_only = tc.get("owner_only", True)
+    stale_h = float(tc.get("stale_hours", 24))
+    now = time.time()
+    budget = [int(tc.get("size_max_files", 200000)), time.monotonic() + float(tc.get("size_max_seconds", 8))]
+    cutoff = None if session_age is None else session_age + SESSION_SLACK_S
+    items = []
+    for root in roots:
+        rpath = expand(root)
+        try:
+            names = os.listdir(rpath)
+        except OSError as e:
+            items.append({"root": root, "error": str(e)})
+            continue
+        for name in sorted(names):
+            if not any(fnmatch.fnmatchcase(name, g) for g in include):
+                continue
+            if any(fnmatch.fnmatchcase(name, g) for g in exclude):
+                continue
+            full = os.path.join(rpath, name)
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            if owner_only and st.st_uid != os.getuid():
+                continue
+            if stat.S_ISSOCK(st.st_mode) or stat.S_ISFIFO(st.st_mode):
+                continue
+            age_s = int(now - st.st_mtime)
+            if cutoff is None:
+                since_start = age_s < stale_h * 3600  # no session age: fall back to recency
+            else:
+                since_start = age_s <= cutoff
+            item = {"path": os.path.join(root, name), "name": name, "group": group_key(name),
+                    "dir": stat.S_ISDIR(st.st_mode), "age_s": age_s, "age": fmt_age(age_s),
+                    "stale": age_s > stale_h * 3600,
+                    "owner": "since-start" if since_start else "earlier"}
+            if sizes:
+                item["bytes"], item["size_complete"] = tree_size(full, budget)
+            items.append(item)
+    items.sort(key=lambda i: i.get("age_s", 0))
+    return {"stale_hours": stale_h, "session_age_known": session_age is not None, "items": items}
+
+
+# ---------- schedules ----------
+
+def check_schedules(cfg, session_age):
+    """Things that will run again without anyone starting them."""
+    sc = cfg.get("schedules", {})
+    include = [re.compile(p) for p in sc.get("include", [])]
+    exclude = [re.compile(p) for p in sc.get("exclude", [])]
+    cutoff = None if session_age is None else session_age + SESSION_SLACK_S
+    now = time.time()
+    items, notes = [], []
+
+    def add(kind, name, detail, age_s=None, path=None):
+        text = f"{name} {detail}"
+        if any(r.search(text) for r in exclude):
+            return
+        since = bool(age_s is not None and cutoff is not None and age_s <= cutoff)
+        item = {"kind": kind, "name": name, "detail": detail, "path": path,
+                "since_start": since, "age_s": age_s,
+                "age": fmt_age(age_s) if age_s is not None else None,
+                "flagged": since or any(r.search(text) for r in include)}
+        items.append(item)
+
+    if sc.get("commands", True):
+        rc, out, err = run(["crontab", "-l"], timeout=10)
+        if rc == 0:
+            for line in out.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    add("crontab", "crontab", line)
+        elif rc not in (1, 127) and "no crontab" not in (err or "").lower():
+            notes.append(f"crontab -l: {(err or '').strip()[:120]}")
+
+    dirs = sc.get("dirs")
+    if dirs is None:
+        dirs = [{"kind": "launchd", "dir": "~/Library/LaunchAgents", "suffix": ".plist"},
+                {"kind": "systemd", "dir": "~/.config/systemd/user", "suffix": ".timer"},
+                {"kind": "claude-task", "dir": os.path.join(claude_dir(), "scheduled-tasks"), "suffix": ""}]
+    for spec in dirs:
+        d, pat, kind = expand(spec["dir"]), spec.get("suffix", ""), spec.get("kind", "schedule")
+        if not os.path.isdir(d):
+            continue
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for name in names:
+            if name.startswith(".") or (pat and not name.endswith(pat)):
+                continue
+            full = os.path.join(d, name)
+            try:
+                age_s = int(now - os.lstat(full).st_mtime)
+            except OSError:
+                continue
+            add(kind, name, f"in {d}", age_s=age_s, path=full)
+
+    if sc.get("commands", True):
+        rc, out, _ = run(["systemctl", "--user", "list-timers", "--all", "--no-legend", "--no-pager"], timeout=10)
+        if rc == 0:
+            for line in out.splitlines():
+                line = line.strip()
+                if line:
+                    add("systemd-timer", line.split()[-1] if line.split() else line, line)
+
+    items.sort(key=lambda i: (not i["flagged"], i["age_s"] if i["age_s"] is not None else 1 << 40))
+    return {"items": items, "notes": notes, "session_age_known": session_age is not None}
+
+
+# ---------- git ----------
+
+def git(repo, *args, timeout=20):
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}
+    return run(["git", "--no-optional-locks", "-C", repo, *args], timeout=timeout, env=env)
+
+
+def check_git(cfg):
+    results = []
+    home = os.path.expanduser("~")
+    for repo_cfg in cfg.get("repos", []):
+        repo = expand(repo_cfg if isinstance(repo_cfg, str) else repo_cfg["path"])
+        r = {"repo": repo,
+             "name": os.path.relpath(repo, home) if repo.startswith(home) else repo,
+             "changes": [], "untracked": [], "gone": [], "unpushed": [], "stashes": 0, "worktrees": []}
+        results.append(r)
+        if not os.path.isdir(repo):
+            r["error"] = "missing"
+            continue
+        rc, out, err = git(repo, "status", "--porcelain=v1", "-b", "--untracked-files=normal")
+        if rc != 0:
+            r["error"] = (err.strip() or "git status failed").splitlines()[0]
+            continue
+        for line in out.splitlines():
+            if line.startswith("## "):
+                r["branch"] = line[3:]
+            elif line.startswith("?? "):
+                r["untracked"].append(line[3:])
+            elif line.strip():
+                r["changes"].append(line)
+        _, remotes, _ = git(repo, "remote")
+        has_remote = bool(remotes.strip())
+        rc, out, _ = git(repo, "for-each-ref", "--format=%(refname:short)%00%(upstream:short)%00%(upstream:track)%00%(committerdate:short)", "refs/heads")
+        for line in out.splitlines():
+            parts = line.split("\0")
+            if len(parts) != 4:
+                continue
+            br, up, track, date = parts
+            if "gone" in track:
+                r["gone"].append({"branch": br, "upstream": up, "date": date})
+                continue
+            ahead = re.search(r"ahead (\d+)", track)
+            if up and ahead:
+                r["unpushed"].append({"branch": br, "commits": int(ahead.group(1)), "upstream": up, "date": date})
+            elif not up and has_remote:
+                _, cnt, _ = git(repo, "rev-list", "--count", br, "--not", "--remotes")
+                if cnt.strip().isdigit() and int(cnt) > 0:
+                    r["unpushed"].append({"branch": br, "commits": int(cnt), "upstream": None, "date": date})
+        _, out, _ = git(repo, "stash", "list")
+        r["stashes"] = len(out.splitlines())
+        _, out, _ = git(repo, "worktree", "list", "--porcelain")
+        wts = [b for b in out.split("\n\n") if b.strip()]
+        for b in wts[1:]:
+            fields = dict((l.split(" ", 1) + [""])[:2] for l in b.splitlines())
+            r["worktrees"].append({"path": fields.get("worktree"),
+                                   "branch": fields.get("branch", "").replace("refs/heads/", ""),
+                                   "prunable": "prunable" in fields})
+    return results
+
+
+def git_attention(r):
+    return bool(r.get("error") or r["changes"] or r["untracked"] or r["gone"] or r["unpushed"])
+
+
+# ---------- remote ----------
+
+# Read-only, POSIX-portable, and the same on every host: enough that a host in
+# ~/.ssh/config can be checked without anyone writing shell for it.
+DEFAULT_REMOTE_CHECKS = [
+    {"label": "my /tmp entries from the last 3 days",
+     "cmd": "find /tmp -maxdepth 1 -user \"$(id -un)\" -mtime -3 ! -name '.*' "
+            "! -name 'systemd-private-*' ! -name 'snap-private-tmp' ! -name 'tmux-*' "
+            "-exec ls -ldt {} + 2>/dev/null | head -60"},
+    {"label": "my watcher-like processes",
+     "cmd": "ps -ax -o user=,pid=,etime=,args= 2>/dev/null | awk -v u=\"$(id -un)\" '$1==u' "
+            "| grep -Ei 'nohup|[_-]watch|poll(er)?|tail -f|while .*sleep' | grep -v awk | head -20"},
+]
+
+SSH_HOST_RE = re.compile(r"^\s*host\s+(.+?)\s*$", re.I)
+SSH_INCLUDE_RE = re.compile(r"^\s*include\s+(.+?)\s*$", re.I)
+
+
+def discover_ssh_hosts(limit=60):
+    """Host aliases from ~/.ssh/config, so a host can be checked by name alone.
+    Patterns (*, ?, !) are skipped: only concrete aliases are addressable."""
+    import glob as _glob
+    base = expand("~/.ssh")
+    files, out = [os.path.join(base, "config")], []
+    for f in list(files):
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    m = SSH_INCLUDE_RE.match(line)
+                    if m:
+                        for pat in m.group(1).split():
+                            pat = expand(pat) if pat.startswith(("~", "/")) else os.path.join(base, pat)
+                            files.extend(sorted(_glob.glob(pat))[:20])
+        except OSError:
+            continue
+    for f in files:
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            m = SSH_HOST_RE.match(line)
+            if not m:
+                continue
+            for name in m.group(1).split():
+                if any(c in name for c in "*?!") or name in out:
+                    continue
+                out.append(name)
+    return out[:limit]
+
+
+def remote_hosts(cfg):
+    """Hosts the checker can reach: configured ones first, then ssh-config aliases.
+    Configured hosts without their own `checks` get the portable defaults."""
+    hosts = {}
+    for h in cfg.get("remote_hosts", []):
+        h = dict(h)
+        if not h.get("checks"):
+            h["checks"] = DEFAULT_REMOTE_CHECKS
+        h["source"] = "config"
+        hosts[h["host"]] = h
+    for name in discover_ssh_hosts():
+        hosts.setdefault(name, {"host": name, "checks": DEFAULT_REMOTE_CHECKS, "source": "ssh-config"})
+    return hosts
+
+
+def check_remote(cfg, wanted):
+    """With no host named, only configured hosts run. A named host may also come
+    from ~/.ssh/config — naming it is the confirmation that it should be touched."""
+    out = []
+    hosts = remote_hosts(cfg)
+    for name in wanted:
+        if name not in hosts:
+            avail = ", ".join(sorted(hosts)) or "none"
+            out.append({"host": name, "error": f"unknown host (available: {avail})"})
+    for name, h in hosts.items():
+        if wanted:
+            if name not in wanted:
+                continue
+        elif h["source"] != "config":
+            continue
+        hr = {"host": h["host"], "source": h["source"], "notes": h.get("notes"), "checks": []}
+        out.append(hr)
+        for chk in h.get("checks", []):
+            cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", h["host"], chk["cmd"]]
+            rc, so, se = run(cmd, timeout=int(chk.get("timeout", 40)))
+            lines = so.rstrip("\n").splitlines()
+            hr["checks"].append({"label": chk.get("label", chk["cmd"][:40]), "cmd": chk["cmd"],
+                                 "rc": rc, "output": lines[:80], "truncated": max(0, len(lines) - 80),
+                                 "stderr": se.strip().splitlines()[-3:] if rc else []})
+    return out
+
+
+# ---------- run state ----------
+
+def state_file(explicit):
+    if explicit:
+        return expand(explicit)
+    env = os.environ.get("WRAPUP_STATE")
+    if env:
+        return expand(env)
+    return os.path.join(claude_dir(), "wrap-up", "state.json")
+
+
+def finding_keys(res):
+    """Stable identifiers for what this run found, so a later run can tell new from known."""
+    keys, s = {}, res["sections"]
+    for r in s.get("memory", []):
+        for f in r["unindexed"]:
+            keys[f"mem:{r['label']}:unindexed:{f}"] = f"{f} not linked from {r['index_name']}"
+        for t in r["broken_links"]:
+            keys[f"mem:{r['label']}:broken:{t}"] = f"broken index link {t}"
+        for fm in r["frontmatter"]:
+            keys[f"mem:{r['label']}:fm:{fm['file']}"] = f"frontmatter {fm['file']}"
+        for dn in r["duplicate_names"]:
+            keys[f"mem:{r['label']}:dup:{dn['name']}"] = f"duplicate name {dn['name']}"
+        if r.get("error"):
+            keys[f"mem:{r['label']}:error"] = r["error"]
+        if r["index"] and r["index"]["warn"]:
+            keys[f"mem:{r['label']}:index-limit"] = "index near its load limit"
+    for i in s.get("due", []):
+        keys[f"due:{i['label']}/{i['file']}:{i['date']}"] = f"{i['keyword']} {i['date']}"
+    for i in s.get("processes", {}).get("items", []):
+        if i["owner"] in ("this-session", "orphan"):
+            keys[f"proc:{i['owner']}:{i['command'][:80]}"] = i["command"][:80]
+    for i in s.get("temp", {}).get("items", []):
+        if "error" not in i:
+            keys[f"temp:{i['path']}"] = i["path"]
+    for i in s.get("schedules", {}).get("items", []):
+        if i["flagged"]:
+            keys[f"sched:{i['kind']}:{i['name']}"] = f"{i['kind']} {i['name']}"
+    for r in s.get("git", []):
+        if r["changes"] or r["untracked"]:
+            keys[f"git:{r['name']}:dirty"] = f"{r['name']} uncommitted"
+        for u in r["unpushed"]:
+            keys[f"git:{r['name']}:unpushed:{u['branch']}"] = f"{r['name']} {u['branch']} unpushed"
+        for g in r["gone"]:
+            keys[f"git:{r['name']}:gone:{g['branch']}"] = f"{r['name']} {g['branch']} upstream gone"
+    return keys
+
+
+def load_state(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            st = json.load(f)
+        if isinstance(st, dict) and isinstance(st.get("seen"), dict):
+            return st
+    except (OSError, ValueError):
+        pass
+    return {"version": 1, "updated": None, "seen": {}}
+
+
+def save_state(path, res, sections):
+    """Record what this run saw. Keys from sections this run skipped are kept."""
+    old = load_state(path)
+    today = dt.date.today().isoformat()
+    keys = finding_keys(res)
+    prefixes = {"memory": "mem:", "due": "due:", "processes": "proc:",
+                "temp": "temp:", "schedules": "sched:", "git": "git:"}
+    covered = tuple(prefixes[s] for s in sections if s in prefixes)
+    seen = {k: v for k, v in old["seen"].items() if not k.startswith(covered)} if covered else dict(old["seen"])
+    for k in keys:
+        seen[k] = old["seen"].get(k, today)
+    st = {"version": 1, "updated": dt.datetime.now().isoformat(timespec="seconds"), "seen": seen}
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(st, f, indent=1)
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
+# ---------- report ----------
+
+def build(cfg, sections, today, sizes):
+    res = {"generated": dt.datetime.now().isoformat(timespec="seconds"), "today": today.isoformat(),
+           "version": VERSION, "config": cfg.get("_config_path"),
+           "discovered": cfg.get("_discovered", []), "sections": {}}
+    procs, ps_error, current, session_age = {}, None, None, None
+    if {"processes", "temp", "schedules"} & set(sections):
+        procs, ps_error = read_procs(cfg)
+        current, session_age = session_info(procs, cfg)
+    res["session"] = {"pid": current, "age_s": session_age,
+                      "age": fmt_age(session_age) if session_age is not None else None}
+    if "memory" in sections:
+        res["sections"]["memory"] = check_memory(cfg)
+    if "due" in sections:
+        res["sections"]["due"] = check_due(cfg, today)
+    if "processes" in sections:
+        res["sections"]["processes"] = check_processes(cfg, procs, ps_error, current)
+    if "temp" in sections:
+        res["sections"]["temp"] = check_temp(cfg, session_age, sizes)
+    if "schedules" in sections:
+        res["sections"]["schedules"] = check_schedules(cfg, session_age)
+    if "git" in sections:
+        res["sections"]["git"] = check_git(cfg)
+    s = res["sections"]
+    att = {}
+    if "memory" in s:
+        att["memory"] = sum(1 for r in s["memory"] if memory_attention(r))
+    if "due" in s:
+        att["due"] = len(s["due"])
+    if "processes" in s:
+        att["processes"] = sum(1 for i in s["processes"]["items"] if i["owner"] in ("this-session", "orphan"))
+        if s["processes"].get("error"):
+            att["processes"] += 1
+    if "temp" in s:
+        att["temp"] = sum(1 for i in s["temp"]["items"] if i.get("owner") == "since-start")
+    if "schedules" in s:
+        att["schedules"] = sum(1 for i in s["schedules"]["items"] if i["since_start"])
+    if "git" in s:
+        att["git"] = sum(1 for r in s["git"] if git_attention(r))
+    res["attention"] = att
+    res["needs_attention"] = any(att.values())
+    return res
+
+
+def human(res, show_temp):
+    s, out = res["sections"], []
+    mark = lambda bad: "!" if bad else "ok"
+
+    if "memory" in s:
+        out.append("== Memory")
+        for r in s["memory"]:
+            idx = r["index"]
+            if idx and idx.get("limited"):
+                size = (f"index {idx['lines']}/{idx['max_lines']} lines, "
+                        f"{idx['bytes'] / 1000:.1f}/{idx['max_bytes'] / 1000:.0f} KB")
+            elif idx:
+                size = f"index {idx['lines']} lines"
+            else:
+                size = "no index file"
+            out.append(f"[{mark(memory_attention(r))}] {r['label']}: {r['files']} notes, {size}  ({r['path']})")
+            if r.get("error"):
+                out.append(f"     ! {r['error']}")
+            if idx and idx["over"]:
+                out.append(f"     ! index is over the load limit ({idx['max_lines']} lines / "
+                           f"{idx['max_bytes'] / 1000:.0f} KB): lines past it are not loaded at session start")
+            elif idx and idx["warn"]:
+                out.append(f"     ! index is near the load limit ({idx['max_lines']} lines / "
+                           f"{idx['max_bytes'] / 1000:.0f} KB): tighten pointers, merge or drop stale ones")
+            cap = 10  # a long pre-existing backlog should not bury the rest of the report
+            for t in r["broken_links"][:cap]:
+                out.append(f"     ! broken link in index: {t}")
+            for f in r["unindexed"][:cap]:
+                out.append(f"     ! not linked from {r['index_name']}: {f}")
+            for fm in r["frontmatter"][:cap]:
+                out.append(f"     ! frontmatter {fm['file']}: {', '.join(fm['problems'])}")
+            for dn in r["duplicate_names"][:cap]:
+                out.append(f"     ! duplicate name '{dn['name']}': {', '.join(dn['files'])}")
+            for sing, many, items in (
+                    ("broken index link", "broken index links", r["broken_links"]),
+                    ("unindexed note", "unindexed notes", r["unindexed"]),
+                    ("note with a frontmatter gap", "notes with frontmatter gaps", r["frontmatter"]),
+                    ("duplicate name", "duplicate names", r["duplicate_names"])):
+                extra = len(items) - cap
+                if extra > 0:
+                    out.append(f"     ! … {extra} more {sing if extra == 1 else many} (use --json)")
+            if r.get("rules"):
+                out.append(f"     - rules: {r['rules']}")
+
+    if "due" in s:
+        out.append("== Dated items (overdue, or due within the window)")
+        if not s["due"]:
+            out.append("[ok] none")
+        for i in s["due"]:
+            out.append(f"[!] {i['date']} {due_word(i['days'])}: {i['label']}/{i['file']}:{i['line']}")
+            out.append(f"     {i['text'][:200]}")
+
+    if "processes" in s:
+        p = s["processes"]
+        out.append(f"== Watcher-like processes (this session = claude pid {p.get('current_session_pid') or '?'})")
+        if p.get("error"):
+            out.append(f"[!] {p['error']}")
+        if not p["items"] and not p.get("error"):
+            out.append("[ok] none")
+        for i in p["items"]:
+            bad = i["owner"] in ("this-session", "orphan")
+            who = i["owner"] + (f" (claude {i['session_pid']})" if i["owner"] == "other-session" else "")
+            out.append(f"[{'!' if bad else '-'}] pid {i['pid']} {i['age']:>6}  {who}: {i['command']}")
+        if any(i["owner"] == "other-session" for i in p["items"]):
+            out.append("     (other-session processes belong to another live Claude session: never stop them)")
+
+    if "temp" in s:
+        t = s["temp"]
+        items = [i for i in t["items"] if "error" not in i]
+        fresh = [i for i in items if i["owner"] == "since-start"]
+        older = [i for i in items if i["owner"] == "earlier"]
+        how = "since this session started" if t.get("session_age_known") else \
+              f"newer than {t['stale_hours']:g}h (session age unknown)"
+        out.append(f"== Temp paths ({len(fresh)} {how}, {len(older)} older)")
+        for i in t["items"]:
+            if "error" in i:
+                out.append(f"[!] {i['root']}: {i['error']}")
+        if not items:
+            out.append("[ok] none")
+        elif not fresh:
+            out.append("[ok] nothing from this session")
+
+        def rows(group):
+            groups = {}
+            for i in group:
+                groups.setdefault((os.path.dirname(i["path"]), i["group"]), []).append(i)
+            return sorted(groups.values(), key=lambda g: min(x["age_s"] for x in g))
+
+        def emit(group, flag, limit):
+            rs = rows(group)
+            for g in rs[:limit]:
+                youngest = min(g, key=lambda x: x["age_s"])
+                size = ""
+                if "bytes" in youngest:
+                    total = sum(x.get("bytes", 0) for x in g)
+                    size = ("≥" if not all(x.get("size_complete", True) for x in g) else "") + fmt_size(total)
+                if len(g) == 1:
+                    name = youngest["path"] + ("/" if youngest["dir"] else "")
+                    out.append(f"[{flag}] {youngest['age']:>6} {size:>8}  {name}")
+                else:
+                    oldest = max(g, key=lambda x: x["age_s"])
+                    out.append(f"[{flag}] {youngest['age']:>6} {size:>8}  "
+                               f"{os.path.join(os.path.dirname(youngest['path']), youngest['group'])}"
+                               f"  ×{len(g)} (oldest {oldest['age']})")
+            if len(rs) > limit:
+                rest = [x for g in rs[limit:] for x in g]
+                out.append(f"     … {plural(len(rest), 'more path')} in {len(rs) - limit} groups "
+                           f"(use --json or --show-temp N)")
+
+        emit(fresh, "!", show_temp)
+        if older:
+            out.append(f"-- older than this session ({plural(len(older), 'path')}; not this session's)")
+            emit(older, "-", max(5, show_temp // 4))
+
+    if "schedules" in s:
+        sch = s["schedules"]
+        flagged = [i for i in sch["items"] if i["flagged"]]
+        out.append(f"== Schedules ({len(sch['items'])} found, {len(flagged)} to look at)")
+        for n in sch["notes"]:
+            out.append(f"     ! {n}")
+        if not sch["items"]:
+            out.append("[ok] none")
+        shown = flagged + [i for i in sch["items"] if not i["flagged"]][:12]
+        for i in shown:
+            flag = "!" if i["since_start"] else ("-" if not i["flagged"] else "?")
+            age = f" {i['age']:>6}" if i["age"] else ""
+            tail = "  (created during this session)" if i["since_start"] else ""
+            out.append(f"[{flag}] {i['kind']:<13}{age}  {i['name']}{tail}")
+            if i["kind"] == "crontab":
+                out.append(f"     {i['detail'][:160]}")
+        hidden = len(sch["items"]) - len(shown)
+        if hidden > 0:
+            out.append(f"     … {plural(hidden, 'more entry', 'more entries')} (use --json)")
+        if sch["items"] and not flagged:
+            out.append("     (none created during this session; match them against your inventory anyway)")
+
+    if "git" in s:
+        out.append("== Git repos")
+        for r in s["git"]:
+            bad = git_attention(r)
+            out.append(f"[{mark(bad)}] {r['name']}" + (f"  ({r['branch']})" if r.get("branch") else ""))
+            if r.get("error"):
+                out.append(f"     ! {r['error']}")
+                continue
+            for c in r["changes"][:15]:
+                out.append(f"     ! changed   {c}")
+            if len(r["changes"]) > 15:
+                out.append(f"     ! … {len(r['changes']) - 15} more changes")
+            for u in r["untracked"][:10]:
+                out.append(f"     ! untracked {u}")
+            if len(r["untracked"]) > 10:
+                out.append(f"     ! … {len(r['untracked']) - 10} more untracked")
+            for g in r["gone"]:
+                out.append(f"     ! upstream gone: {g['branch']} (last commit {g['date']})")
+            for u in r["unpushed"]:
+                where = f"ahead of {u['upstream']}" if u["upstream"] else "no upstream, not on any remote"
+                out.append(f"     ! unpushed: {u['branch']}: {plural(u['commits'], 'commit')} {where}")
+            if r["stashes"]:
+                out.append(f"     - {plural(r['stashes'], 'stash', 'stashes')}")
+            for w in r["worktrees"]:
+                out.append(f"     - worktree {w['path']} [{w['branch'] or 'detached'}]"
+                           + (" PRUNABLE" if w["prunable"] else ""))
+
+    if "remote" in res:
+        for h in res["remote"]:
+            out.append(f"== Remote: {h['host']}")
+            if h.get("error"):
+                out.append(f"[!] {h['error']}")
+                continue
+            for c in h["checks"]:
+                out.append(f"-- {c['label']}" + (f"  (exit {c['rc']})" if c["rc"] else ""))
+                out.append(f"   $ {c['cmd'][:300]}")
+                out.extend(f"   {l}" for l in c["output"])
+                if c["truncated"]:
+                    out.append(f"   … {c['truncated']} more lines")
+                out.extend(f"   ! {l}" for l in c["stderr"])
+
+    out.append("")
+    if res["needs_attention"]:
+        parts = [f"{k} {v}" for k, v in res["attention"].items() if v]
+        out.append("NEEDS ATTENTION: " + ", ".join(parts))
+    else:
+        out.append("All clear.")
+    return "\n".join(out)
+
+
+def brief(res, state):
+    """One to three lines for a session-start notice; '' when nothing was left behind."""
+    s, frags = res["sections"], []
+    seen = (state or {}).get("seen", {})
+    keys = finding_keys(res)
+    known = {k: seen[k] for k in keys if k in seen}
+
+    def is_new(prefix, *parts):
+        return f"{prefix}{':'.join(parts)}" not in seen
+
+    if "memory" in s:
+        mem = s["memory"]
+        n_unidx = sum(1 for r in mem for f in r["unindexed"] if is_new("mem:", r["label"], "unindexed", f))
+        n_broken = sum(1 for r in mem for t in r["broken_links"] if is_new("mem:", r["label"], "broken", t))
+        n_fm = sum(1 for r in mem for f in r["frontmatter"] if is_new("mem:", r["label"], "fm", f["file"]))
+        n_dup = sum(1 for r in mem for d in r["duplicate_names"] if is_new("mem:", r["label"], "dup", d["name"]))
+        if n_unidx:
+            frags.append(plural(n_unidx, "unindexed memory", "unindexed memories"))
+        if n_broken:
+            frags.append(plural(n_broken, "broken index link"))
+        if n_fm:
+            frags.append(plural(n_fm, "memory file") + " with frontmatter gaps")
+        if n_dup:
+            frags.append(plural(n_dup, "duplicate memory name"))
+        for r in mem:
+            if r.get("error") and is_new("mem:", r["label"], "error"):
+                frags.append(f"{r['label']} memory: {r['error']}")
+            elif r["index"] and r["index"]["warn"] and is_new("mem:", r["label"], "index-limit"):
+                i = r["index"]
+                frags.append(f"{r['label']} {r['index_name']} at {i['lines']}/{i['max_lines']} lines, "
+                             f"{i['bytes'] / 1000:.1f}/{i['max_bytes'] / 1000:.0f} KB")
+    if "due" in s:
+        fresh = [i for i in s["due"] if is_new("due:", f"{i['label']}/{i['file']}", i["date"])]
+        if fresh:
+            first = fresh[0]
+            more = f" (+{len(fresh) - 1} more)" if len(fresh) > 1 else ""
+            frags.append(f"{plural(len(fresh), 'dated memory item')} coming due: "
+                         f"\"{first['keyword']} {first['date']}\" in {first['file']} "
+                         f"({due_word(first['days'])}){more}")
+    if "processes" in s:
+        orphans = [i for i in s["processes"]["items"] if i["owner"] == "orphan"]
+        if orphans:
+            o = orphans[0]
+            frags.append(f"{plural(len(orphans), 'orphan watcher')} from an earlier session "
+                         f"(pid {o['pid']}, {o['age']})")
+    if "schedules" in s:
+        fresh = [i for i in s["schedules"]["items"]
+                 if i["flagged"] and is_new("sched:", i["kind"], i["name"])]
+        if fresh:
+            frags.append(f"{plural(len(fresh), 'schedule')} to check ({fresh[0]['kind']} {fresh[0]['name']})")
+    if "temp" in s:
+        stale = [i for i in s["temp"]["items"] if i.get("stale") and is_new("temp:", i["path"])]
+        if stale:
+            oldest = max(stale, key=lambda i: i["age_s"])
+            frags.append(f"{plural(len(stale), 'temp path')} older than "
+                         f"{s['temp']['stale_hours']:g}h (oldest {oldest['age']})")
+    if "git" in s:
+        for r in s["git"]:
+            bits = []
+            if (r["changes"] or r["untracked"]) and is_new("git:", r["name"], "dirty"):
+                bits.append("uncommitted work")
+            unpushed = [u for u in r["unpushed"] if is_new("git:", r["name"], "unpushed", u["branch"])]
+            if unpushed:
+                bits.append(plural(sum(u["commits"] for u in unpushed), "unpushed commit"))
+            gone = [g for g in r["gone"] if is_new("git:", r["name"], "gone", g["branch"])]
+            if gone:
+                bits.append(plural(len(gone), "branch", "branches") + " with upstream gone")
+            if bits:
+                frags.append(f"{os.path.basename(r['repo'])}: {', '.join(bits)}")
+
+    lines = []
+    if frags:
+        lines.append("Left behind: " + "; ".join(frags) + ".")
+    if known:
+        first = min(known.values())
+        lines.append(f"Still open from before: {plural(len(known), 'item')}, oldest first seen {first}.")
+    if not lines:
+        return ""
+    lines.append("Run /wrap-up to tidy up, or `wrapup-check` for details.")
+    return "\n".join(lines)
+
+
+def show_config(cfg):
+    out = [f"wrapup-check {VERSION}",
+           f"config: {cfg.get('_config_path') or '(none — everything discovered)'}",
+           f"discovered: {', '.join(cfg.get('_discovered')) or '(nothing; config supplies all keys)'}",
+           "", "memory_dirs:"]
+    for d in memory_dirs(cfg):
+        bits = [f"index={d['index'] or 'none'}"]
+        if d["recursive"]:
+            bits.append("recursive")
+        if not d["require_frontmatter"]:
+            bits.append("no-frontmatter-check")
+        if not d["index_limits"]:
+            bits.append("no-index-limit")
+        if d["include"] != ["*.md"]:
+            bits.append("include=" + ",".join(d["include"]))
+        if d["exclude"]:
+            bits.append("exclude=" + ",".join(d["exclude"]))
+        out.append(f"  {d['label']:<16} {d['path']}  [{' '.join(bits)}]")
+    out.append("")
+    out.append("repos:")
+    out += [f"  {expand(r if isinstance(r, str) else r['path'])}" for r in cfg.get("repos", [])] or ["  (none)"]
+    out.append("")
+    out.append("temp roots: " + ", ".join(cfg.get("temp", {}).get("roots", [])))
+    hosts = remote_hosts(cfg)
+    conf = [n for n, h in hosts.items() if h["source"] == "config"]
+    ssh = [n for n, h in hosts.items() if h["source"] == "ssh-config"]
+    out.append("")
+    out.append("remote hosts, run by `--remote` with no argument:")
+    for n in conf:
+        custom = "custom checks" if hosts[n]["checks"] is not DEFAULT_REMOTE_CHECKS else "default checks"
+        out.append(f"  {n:<16} [{custom}]" + (f"  {hosts[n]['notes'][:80]}" if hosts[n].get("notes") else ""))
+    if not conf:
+        out.append("  (none)")
+    out.append("from ~/.ssh/config, run only when named — `--remote <host>`, default checks:")
+    out.append("  " + (", ".join(ssh) if ssh else "(none)"))
+    out.append("")
+    out.append("brief sections: " + ", ".join(cfg.get("brief_sections", BRIEF_DEFAULT)))
+    return "\n".join(out)
+
+
+BRIEF_DEFAULT = ["memory", "due", "processes", "schedules", "temp", "git"]
+
+
+def notice_enabled(from_plugin):
+    """A hook a plugin registered stays silent until the installer turns the notice
+    on. A hook written by hand in settings.json is already the opt-in."""
+    if not from_plugin:
+        return True
+    v = os.environ.get("CLAUDE_PLUGIN_OPTION_SESSION_NOTICE") or ""
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Read-only end-of-session checker for the wrap-up skill.")
+    ap.add_argument("--config", help="config file (default: $WRAPUP_CONFIG, ~/.claude/wrap-up/config.json, then one beside this script)")
+    ap.add_argument("--no-config", action="store_true", help="ignore config files and discover everything")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--brief", action="store_true", help="one to three lines, only when something was left behind")
+    ap.add_argument("--hook", action="store_true", help="--brief wrapped as SessionStart hook JSON; always exits 0")
+    ap.add_argument("--plugin", action="store_true", help="with --hook: a plugin registered this hook, so stay silent unless the installer turned the notice on")
+    ap.add_argument("--only", help=f"comma-separated sections: {','.join(SECTIONS)}")
+    ap.add_argument("--remote", nargs="*", metavar="HOST", help="also run the config's remote checks (all hosts, or the ones named); each command is echoed before it runs")
+    ap.add_argument("--today", help="pretend today is YYYY-MM-DD (testing)")
+    ap.add_argument("--no-sizes", action="store_true", help="skip temp-path sizes (faster)")
+    ap.add_argument("--show-temp", type=int, default=None, help="temp groups to list (default from config, 40)")
+    ap.add_argument("--show-config", action="store_true", help="print the effective config and exit")
+    ap.add_argument("--state", help="run-state file (default: $WRAPUP_STATE, then ~/.claude/wrap-up/state.json)")
+    ap.add_argument("--no-save-state", action="store_true", help="do not record this run's findings")
+    ap.add_argument("--version", action="version", version=f"wrapup-check {VERSION}")
+    a = ap.parse_args(argv)
+
+    try:
+        cfg = discover({"_config_path": None}) if a.no_config else load_config(a.config)
+        today = dt.date.fromisoformat(a.today) if a.today else dt.date.today()
+        if a.only:
+            sections = [x.strip() for x in a.only.split(",") if x.strip()]
+            bad = [x for x in sections if x not in SECTIONS]
+            if bad:
+                raise ConfigError(f"unknown section(s): {', '.join(bad)}")
+        elif a.brief or a.hook:
+            sections = cfg.get("brief_sections", BRIEF_DEFAULT)
+        else:
+            sections = list(SECTIONS)
+    except (ConfigError, ValueError) as e:
+        if a.hook:
+            return 0
+        print(f"wrapup-check: {e}", file=sys.stderr)
+        return 2
+
+    if a.show_config:
+        print(show_config(cfg))
+        return 0
+
+    spath = state_file(a.state)
+    if a.hook:
+        if not notice_enabled(a.plugin):
+            return 0
+        try:
+            text = brief(build(cfg, sections, today, sizes=False), load_state(spath))
+        except Exception:  # a session-start notice must never get in the way
+            return 0
+        if text:
+            print(json.dumps({"systemMessage": "wrap-up check — " + text}))
+        return 0
+
+    res = build(cfg, sections, today, sizes=not (a.no_sizes or a.brief))
+    if a.remote is not None:
+        res["remote"] = check_remote(cfg, a.remote)
+    if a.brief:
+        text = brief(res, load_state(spath))
+        if text:
+            print(text)
+        return 1 if text else 0
+    if not a.no_save_state:
+        res["state_saved"] = save_state(spath, res, sections)
+        res["state_file"] = spath
+    if a.json:
+        print(json.dumps(res, indent=1, ensure_ascii=False))
+    else:
+        print(human(res, a.show_temp if a.show_temp is not None else cfg.get("temp", {}).get("show", 40)))
+    return 1 if res["needs_attention"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

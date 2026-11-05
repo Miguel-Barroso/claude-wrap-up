@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/skills/wrap-up/wrapup-check --hook --plugin",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

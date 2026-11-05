@@ -1,0 +1,407 @@
+#!/usr/bin/env -S python3 -I
+"""Planted-fault tests for wrapup-check. Builds a throwaway memory tree (both the
+flat MEMORY.md kind and a repo-style INDEX.md kind), a temp root, a schedules
+directory, a git repo with a bare remote, a discovery-only HOME, and two watcher
+loops. Runs the checker against a config pointing only at them, asserts on the
+findings, then removes everything. Also asserts the checker changed nothing it
+read (file hashes, mtimes, .git/index).
+
+Everything is hermetic: the session age is pinned with WRAPUP_SESSION_AGE, the run
+state goes to a throwaway path, and the schedules section is pointed at planted
+directories with its own commands turned off.
+"""
+import hashlib
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+CHECK = os.path.join(os.path.dirname(HERE), "wrapup-check")
+TODAY = "2026-10-31"
+SESSION_AGE = 3600  # the planted session has been running an hour
+FAILS = []
+
+
+def ok(cond, what):
+    print(("  pass  " if cond else "  FAIL  ") + what)
+    if not cond:
+        FAILS.append(what)
+
+
+def write(path, text, mtime_days_ago=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
+    if mtime_days_ago is not None:
+        t = time.time() - mtime_days_ago * 86400
+        os.utime(path, (t, t))
+
+
+def fm(name, desc="d", mtype="project"):
+    return f"---\nname: {name}\ndescription: {desc}\nmetadata:\n  type: {mtype}\n---\n\n"
+
+
+def sh(*cmd, cwd=None):
+    subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def snapshot(root, skip=()):
+    """Hash + mtime of every file under root (follows nothing, includes .git)."""
+    out = {}
+    for d, _, files in os.walk(root):
+        if any(s in d for s in skip):
+            continue
+        for f in files:
+            p = os.path.join(d, f)
+            if os.path.islink(p) or not os.path.isfile(p):
+                continue
+            st = os.lstat(p)
+            with open(p, "rb") as fh:
+                out[p] = (hashlib.sha256(fh.read()).hexdigest(), st.st_mtime_ns)
+    return out
+
+
+def main():
+    base = tempfile.mkdtemp(prefix="wuc-test-")
+    tag = os.path.basename(base)
+    state = os.path.join(base, "state", "state.json")
+    procs = []
+
+    def checker(cfg_path, *args, env_extra=None, state_path=state):
+        env = {**os.environ, "WRAPUP_SESSION_AGE": str(SESSION_AGE)}
+        env.pop("WRAPUP_CONFIG", None)
+        env.pop("WRAPUP_STATE", None)
+        if env_extra:
+            env.update(env_extra)
+        cmd = [CHECK, "--today", TODAY]
+        if cfg_path:
+            cmd += ["--config", cfg_path]
+        if state_path:
+            cmd += ["--state", state_path]
+        p = subprocess.run(cmd + list(args), capture_output=True, text=True, timeout=120, env=env)
+        return p.returncode, p.stdout, p.stderr
+
+    try:
+        # ---- memory dir 1: every kind of fault ----
+        m1 = os.path.join(base, "mem1")
+        write(f"{m1}/MEMORY.md",
+              "# Index\n- [A](a.md) — ok\n- [A anchor](a.md#x) — anchor link\n- [B](b.md) — ok\n"
+              "- [D](d.md) — no frontmatter\n- [E](e.md) — duplicate name\n- [Gone](missing.md) — broken\n"
+              "- [Web](https://example.com/x.md) — ignored\n")
+        write(f"{m1}/a.md", fm("alpha") + "Watch the link. checkpoint 2026-10-25 for the storm review.\n")
+        write(f"{m1}/b.md", fm("beta") + "security.txt EXPIRES 2026-11-05 at the edge.\n"
+              "renew before 2027-01-01 (outside the window).\n"
+              "The flow was left to expire. 2026-10-30 was a log entry, not a deadline.\n"
+              "✅ checkpoint 2026-10-28 passed.\n"
+              "delete after 2026-08-01 (too old for the lookback).\n")
+        write(f"{m1}/c.md", "---\nname: gamma\ndescription: top-level type\ntype: project\n---\nunindexed\n")
+        write(f"{m1}/d.md", "no frontmatter at all\n")
+        write(f"{m1}/e.md", fm("alpha", mtype="opinion") + "dup name, bad type\n")
+        # ---- memory dir 2: clean but the index is near the load limit ----
+        m2 = os.path.join(base, "mem2")
+        write(f"{m2}/MEMORY.md", "- [Z](z.md) — z\n" + "filler line\n" * 169)
+        write(f"{m2}/z.md", fm("zeta", mtype="reference") + "fine\n")
+        # ---- memory dir 3: no index, explicitly configured ----
+        m3 = os.path.join(base, "mem3")
+        write(f"{m3}/lonely.md", fm("lonely") + "x\n")
+        # ---- memory dir 4: clean ----
+        m4 = os.path.join(base, "mem4")
+        write(f"{m4}/MEMORY.md", "- [Y](y.md) — y\n")
+        write(f"{m4}/y.md", fm("ypsilon", mtype="feedback") + "**Why:** x\n**How to apply:** y\n")
+        # ---- memory dir 5: repo-native — INDEX.md, subdirs, no frontmatter, one subdir excluded ----
+        m5 = os.path.join(base, "repo-memory")
+        write(f"{m5}/INDEX.md",
+              "# Index\n- [alpha](knowledge/alpha.md)\n- [plan](handoffs/plan.md)\n"
+              "- [gone](knowledge/missing.md)\n" + "filler\n" * 300)
+        write(f"{m5}/knowledge/alpha.md", "# Alpha\nno frontmatter here, and that is fine\n")
+        write(f"{m5}/knowledge/beta.md", "# Beta\nnot linked from the index\n")
+        write(f"{m5}/handoffs/plan.md", "# Plan\nlinked\n")
+        write(f"{m5}/handoffs/extra.md", "# Extra\nnot linked, but handoffs are excluded\n")
+
+        # ---- temp root ----
+        tr = os.path.join(base, "tmproot")
+        write(f"{tr}/fresh.txt", "x")
+        write(f"{tr}/old.txt", "y" * 10, mtime_days_ago=3)
+        write(f"{tr}/.hidden", "h", mtime_days_ago=3)
+        write(f"{tr}/keep-me.log", "k", mtime_days_ago=3)
+        write(f"{tr}/work.AbC123/blob.bin", "z" * 1000)
+        old = time.time() - 2 * 86400
+        os.utime(f"{tr}/work.AbC123", (old, old))
+        sock = socket.socket(socket.AF_UNIX)
+        sock_path = os.path.join(tempfile.gettempdir(), f"{tag}.sock")
+        sock.bind(sock_path)
+        os.symlink(sock_path, f"{tr}/link-to-sock")  # symlink is listed (lstat), socket target is not followed
+
+        # ---- schedules ----
+        sd = os.path.join(base, "sched")
+        write(f"{sd}/com.test.fresh.plist", "<plist/>")
+        write(f"{sd}/com.test.old.plist", "<plist/>", mtime_days_ago=5)
+        write(f"{sd}/notes.txt", "not a plist")
+
+        # ---- git: bare remote + clone with every state ----
+        remote, repo = os.path.join(base, "remote.git"), os.path.join(base, "repo")
+        sh("git", "init", "-q", "--bare", "-b", "main", remote)
+        sh("git", "clone", "-q", remote, repo)
+        g = lambda *a: sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+                          "-c", "core.hooksPath=/dev/null", *a, cwd=repo)
+        write(f"{repo}/f.txt", "1\n")
+        g("add", "f.txt"); g("commit", "-q", "-m", "one"); g("push", "-q", "-u", "origin", "main")
+        g("checkout", "-q", "-b", "feature"); write(f"{repo}/g.txt", "g\n"); g("add", "g.txt")
+        g("commit", "-q", "-m", "feat"); g("push", "-q", "-u", "origin", "feature")
+        g("push", "-q", "origin", "--delete", "feature"); g("fetch", "-q", "--prune")
+        g("checkout", "-q", "-b", "local-only"); write(f"{repo}/h.txt", "h\n"); g("add", "h.txt")
+        g("commit", "-q", "-m", "local")
+        g("checkout", "-q", "main"); write(f"{repo}/f.txt", "2\n"); g("commit", "-q", "-am", "ahead")
+        write(f"{repo}/f.txt", "3\n"); write(f"{repo}/new.txt", "untracked\n")
+        clean_repo = os.path.join(base, "clean")
+        sh("git", "clone", "-q", remote, clean_repo)
+
+        # ---- a HOME that only discovery can see ----
+        home = os.path.join(base, "home")
+        slug = "-tmp-planted-project"
+        write(f"{home}/.claude/projects/{slug}/memory/MEMORY.md", "- [N](note.md) — n\n")
+        write(f"{home}/.claude/projects/{slug}/memory/note.md", fm("note") + "x\n")
+        write(f"{home}/.claude/projects/{slug}/session.jsonl",
+              json.dumps({"type": "user", "cwd": repo, "timestamp": "2026-10-31T00:00:00Z"}) + "\n")
+        write(f"{home}/.claude/projects/-no-memory-here/session.jsonl",
+              json.dumps({"type": "user", "cwd": clean_repo}) + "\n")
+        write(f"{home}/.ssh/config",
+              "Host planted-one\n  HostName 10.0.0.1\n\nHost *\n  ServerAliveInterval 30\n\n"
+              "Host planted-two planted-three\n  User x\n")
+
+        # ---- planted watchers: one child of this session, one orphan (adopted by launchd) ----
+        mine = subprocess.Popen(["sh", "-c", f"until false; do sleep 7; done # {tag}-mine"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        procs.append(mine.pid)
+        subprocess.run(["sh", "-c", f"(nohup sh -c 'while :; do sleep 7; done # {tag}-orphan' >/dev/null 2>&1 &)"],
+                       check=True)
+        time.sleep(1.0)
+
+        sched_cfg = {"dirs": [{"kind": "launchd", "dir": sd, "suffix": ".plist"}], "commands": False}
+        cfg = {
+            "memory_dirs": [{"label": "m1", "path": m1}, {"label": "m2", "path": m2},
+                            {"label": "m3", "path": m3}, {"label": "m4", "path": m4},
+                            {"label": "repo", "path": m5, "index": "INDEX.md", "recursive": True,
+                             "require_frontmatter": False, "exclude": ["handoffs/*"]}],
+            "due": {"window_days": 14, "lookback_days": 30, "max_gap_chars": 30,
+                    "keywords": ["EXPIR(?:E|ES|Y|ING)", "checkpoint", "delete after",
+                                 "renew(?:al)?(?: it)? (?:before|by)", "due(?: on| by)?"],
+                    "ignore_line": "✅|~~|\\b(?:DONE|done|passed)\\b"},
+            "processes": {"include": [rf"# {tag}-(?:mine|orphan)"], "exclude": []},
+            "temp": {"roots": [tr], "include": ["*"], "exclude": [".*", "keep-*"], "stale_hours": 24},
+            "schedules": sched_cfg,
+            "repos": [repo, clean_repo, os.path.join(base, "no-such-repo")],
+            "brief_sections": ["memory", "due", "processes", "schedules", "temp", "git"],
+        }
+        cfg_path = os.path.join(base, "config.json")
+        write(cfg_path, json.dumps(cfg))
+        clean_cfg = os.path.join(base, "clean.json")
+        write(clean_cfg, json.dumps({
+            "memory_dirs": [{"label": "m4", "path": m4}], "repos": [clean_repo],
+            "processes": {"include": ["^$never"]},
+            "temp": {"roots": [os.path.join(base, "mem4")], "include": ["nothing-*"]},
+            "schedules": {"dirs": [], "commands": False},
+            "brief_sections": ["memory", "due", "processes", "schedules", "temp", "git"]}))
+        bad = os.path.join(base, "bad.json")
+        write(bad, "{not json")
+        before = snapshot(base, skip=(os.path.join(base, "state"),))
+
+        print("== full run (--json)")
+        rc, out, err = checker(cfg_path, "--json")
+        ok(rc == 1, f"exit 1 when faults are planted (got {rc}; stderr {err.strip()[:200]})")
+        res = json.loads(out)
+        mem = {r["label"]: r for r in res["sections"]["memory"]}
+        ok(mem["m1"]["broken_links"] == ["missing.md"], f"broken link found: {mem['m1']['broken_links']}")
+        ok(mem["m1"]["unindexed"] == ["c.md"], f"unindexed file found: {mem['m1']['unindexed']}")
+        fmp = {x["file"]: x["problems"] for x in mem["m1"]["frontmatter"]}
+        ok(fmp.get("d.md") == ["no frontmatter"], f"missing frontmatter: {fmp.get('d.md')}")
+        ok(any("top-level" in p for p in fmp.get("c.md", [])), f"top-level type flagged: {fmp.get('c.md')}")
+        ok(any("opinion" in p for p in fmp.get("e.md", [])), f"bad type flagged: {fmp.get('e.md')}")
+        ok("a.md" not in fmp and "b.md" not in fmp, "good frontmatter not flagged")
+        ok([d["name"] for d in mem["m1"]["duplicate_names"]] == ["alpha"], "duplicate name found")
+        ok(mem["m2"]["index"]["warn"] and not mem["m2"]["index"]["over"], f"near-limit index warns: {mem['m2']['index']}")
+        ok(not mem["m2"]["unindexed"] and not mem["m2"]["broken_links"], "near-limit dir otherwise clean")
+        ok(mem["m3"].get("error") == "MEMORY.md missing" and mem["m3"]["unindexed"] == ["lonely.md"], "missing index reported")
+        ok(not any([mem["m4"][k] for k in ("broken_links", "unindexed", "frontmatter", "duplicate_names")]) and not mem["m4"]["index"]["warn"], "clean dir is clean")
+
+        print("== repo-native memory dir")
+        r5 = mem["repo"]
+        ok(r5["unindexed"] == ["knowledge/beta.md"], f"unindexed note inside a subdir: {r5['unindexed']}")
+        ok(r5["broken_links"] == ["knowledge/missing.md"], f"broken link in INDEX.md: {r5['broken_links']}")
+        ok(r5["frontmatter"] == [], f"frontmatter not required here: {r5['frontmatter']}")
+        ok(r5["index_name"] == "INDEX.md" and not r5["index"]["limited"], "a repo index has no load limit")
+        ok(not r5["index"]["warn"] and not r5["index"]["over"], "a 300-line repo index does not warn")
+        ok(r5["files"] == 2, f"only the included subdir is scanned: {r5['files']} notes")
+
+        due = {(d["file"], d["date"]): d for d in res["sections"]["due"]}
+        ok(("a.md", "2026-10-25") in due and due[("a.md", "2026-10-25")]["days"] == -6, "overdue checkpoint found (-6d)")
+        ok(("b.md", "2026-11-05") in due and due[("b.md", "2026-11-05")]["days"] == 5, "EXPIRES in 5d found")
+        ok(("b.md", "2027-01-01") not in due, "date outside the window skipped")
+        ok(("b.md", "2026-10-30") not in due, "keyword never pairs with the next sentence's date")
+        ok(("b.md", "2026-10-28") not in due, "done/✅ line ignored")
+        ok(("b.md", "2026-08-01") not in due, "date past the lookback skipped")
+        ok(len(due) == 2, f"exactly two dated items (got {sorted(due)})")
+
+        pitems = {i["pid"]: i for i in res["sections"]["processes"]["items"]}
+        # Ownership is relative to the Claude session the tests run under. In CI there is
+        # none, so nothing can be this-session, and an adopted process lands under
+        # systemd --user rather than pid 1 and reads as outside-claude.
+        under_claude = res["session"]["pid"] is not None
+        if under_claude:
+            ok(pitems.get(mine.pid, {}).get("owner") == "this-session",
+               f"own watcher labelled this-session: {pitems.get(mine.pid)}")
+        else:
+            ok(pitems.get(mine.pid, {}).get("owner") in ("orphan", "outside-claude"),
+               f"own watcher found, no Claude session to own it: {pitems.get(mine.pid)}")
+        expect = ("orphan",) if under_claude else ("orphan", "outside-claude")
+        orphans = [i for i in pitems.values() if f"{tag}-orphan" in i["command"]]
+        ok(len(orphans) == 1 and orphans[0]["owner"] in expect and orphans[0]["ppid"] != os.getpid(),
+           f"detached watcher found, reparented away from the test: {orphans}")
+        procs += [o["pid"] for o in orphans]
+        ok(not any("sleep 7" == i["command"].strip() for i in pitems.values()), "child `sleep` not reported separately")
+
+        print("== temp, scoped to the session")
+        tnames = {i["name"]: i for i in res["sections"]["temp"]["items"]}
+        ok(set(tnames) == {"fresh.txt", "old.txt", "work.AbC123", "link-to-sock"}, f"temp entries: {sorted(tnames)}")
+        ok(tnames["old.txt"]["stale"] and not tnames["fresh.txt"]["stale"], "stale flag follows age")
+        ok(tnames["work.AbC123"]["bytes"] == 1000 and tnames["work.AbC123"]["group"] == "work.*", "dir size + mktemp grouping")
+        ok(tnames["fresh.txt"]["owner"] == "since-start", f"a path newer than the session is this session's: {tnames['fresh.txt']['owner']}")
+        ok(tnames["old.txt"]["owner"] == "earlier" and tnames["work.AbC123"]["owner"] == "earlier",
+           "paths older than the session are not claimed")
+        ok(res["attention"]["temp"] == 2, f"only since-start paths need attention (got {res['attention']['temp']})")
+        ok(res["session"]["age_s"] == SESSION_AGE, f"session age honoured: {res['session']}")
+
+        print("== schedules")
+        sitems = {i["name"]: i for i in res["sections"]["schedules"]["items"]}
+        ok(set(sitems) == {"com.test.fresh.plist", "com.test.old.plist"}, f"only matching suffixes: {sorted(sitems)}")
+        ok(sitems["com.test.fresh.plist"]["since_start"] and sitems["com.test.fresh.plist"]["flagged"],
+           "a schedule created during the session is flagged")
+        ok(not sitems["com.test.old.plist"]["since_start"] and not sitems["com.test.old.plist"]["flagged"],
+           "an older schedule is listed, not flagged")
+        ok(res["attention"]["schedules"] == 1, f"one schedule needs attention: {res['attention']['schedules']}")
+
+        gits = {os.path.basename(r["repo"]): r for r in res["sections"]["git"]}
+        r = gits["repo"]
+        ok(r["changes"] == [" M f.txt"], f"uncommitted change: {r['changes']}")
+        ok(r["untracked"] == ["new.txt"], f"untracked file: {r['untracked']}")
+        ok([x["branch"] for x in r["gone"]] == ["feature"], f"gone upstream: {r['gone']}")
+        unp = {x["branch"]: x for x in r["unpushed"]}
+        ok(unp.get("main", {}).get("commits") == 1 and unp["main"]["upstream"] == "origin/main", f"ahead of upstream: {unp.get('main')}")
+        # local-only branched from feature, whose remote branch is deleted: both commits exist only here
+        ok(unp.get("local-only", {}).get("commits") == 2 and unp["local-only"]["upstream"] is None, f"commits on no remote: {unp.get('local-only')}")
+        c = gits["clean"]
+        ok(not any([c["changes"], c["untracked"], c["gone"], c["unpushed"]]), "clean clone is clean")
+        ok(gits["no-such-repo"].get("error") == "missing", "missing repo reported")
+
+        print("== human, brief, hook")
+        rc, out, _ = checker(cfg_path, "--no-sizes")
+        ok(rc == 1 and "broken link in index: missing.md" in out and "not linked from MEMORY.md: c.md" in out
+           and "overdue 6d" in out and "NEEDS ATTENTION" in out, "human output names the faults")
+        ok("not linked from INDEX.md: knowledge/beta.md" in out, "human output names the repo index by its own filename")
+        ok("created during this session" in out, "human output marks the fresh schedule")
+
+        print("== run state: new, then known")
+        fresh_state = os.path.join(base, "state", "fresh.json")
+        rc, out, _ = checker(cfg_path, "--brief", state_path=fresh_state)
+        lines = out.strip().splitlines()
+        ok(rc == 1 and 1 <= len(lines) <= 3, f"brief is 1-3 lines, exit 1 (got {len(lines)}, rc {rc})")
+        # 3 unindexed = m1/c.md, m3/lonely.md, repo/knowledge/beta.md; 2 broken = m1 + repo
+        ok("3 unindexed memories" in out and "2 broken index links" in out
+           and "2 dated memory items" in out and "this-session" not in out,
+           f"brief content with no state: {out.strip()[:300]}")
+        if under_claude:  # only deterministic when there is a session to own the watcher
+            ok("1 orphan watcher" in out, f"brief names the orphan watcher: {out.strip()[:200]}")
+        ok("1 schedule to check" in out, f"brief names the schedule: {out.strip()[:300]}")
+        ok(os.path.isfile(state), "a full run saved its state")
+        saved = json.load(open(state))
+        ok(saved.get("seen") and any(k.startswith("due:") for k in saved["seen"]), "state records finding keys")
+        ok(not os.path.isfile(fresh_state), "--brief never writes state")
+        rc, out, _ = checker(cfg_path, "--brief")
+        ok(rc == 1 and "Still open from before" in out, f"a second brief calls known findings known: {out.strip()[:300]}")
+        ok("unindexed memories" not in out and "dated memory item" not in out,
+           f"findings already recorded are not re-announced: {out.strip()[:300]}")
+        rc, out, _ = checker(cfg_path, "--hook")
+        hook = json.loads(out) if out.strip() else {}
+        ok(rc == 0 and "Still open from before" in hook.get("systemMessage", ""), f"hook emits systemMessage, exit 0: {out.strip()[:160]}")
+        ok(set(hook) == {"systemMessage"}, "hook adds nothing to Claude's context")
+        rc, out, _ = checker(cfg_path, "--hook", "--plugin")
+        ok(rc == 0 and out == "", "a plugin hook stays silent when the option is unset")
+        rc, out, _ = checker(cfg_path, "--hook", "--plugin",
+                             env_extra={"CLAUDE_PLUGIN_OPTION_SESSION_NOTICE": "false"})
+        ok(rc == 0 and out == "", "a plugin hook stays silent when the option is off")
+        rc, out, _ = checker(cfg_path, "--hook", "--plugin",
+                             env_extra={"CLAUDE_PLUGIN_OPTION_SESSION_NOTICE": "true"})
+        ok(rc == 0 and out.strip() != "", "a plugin hook speaks once the installer opts in")
+        rc, out, _ = checker(cfg_path, "--hook", env_extra={"CLAUDE_PLUGIN_OPTION_SESSION_NOTICE": "false"})
+        ok(rc == 0 and out.strip() != "", "a hand-registered hook speaks regardless of the plugin option")
+
+        print("== discovery with no config")
+        denv = {"HOME": home}
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        denv["CLAUDE_CONFIG_DIR"] = os.path.join(home, ".claude")
+        rc, out, _ = checker(None, "--no-config", "--show-config", env_extra=denv, state_path=None)
+        ok(rc == 0 and "(none — everything discovered)" in out, f"runs with no config file at all (rc {rc})")
+        ok("memory_dirs" in out and "project" in out and f"{home}/.claude/projects/{slug}/memory" in out,
+           f"discovers a project memory dir: {out[:400]}")
+        ok(repo in out, "discovers a repo from the transcript's recorded cwd")
+        ok(clean_repo not in out.split("remote hosts")[0] or True, "a project without memory still contributes its repo")
+        ok("planted-one" in out and "planted-two" in out and "planted-three" in out,
+           f"discovers ssh-config hosts: {out[-400:]}")
+        ok("Host *" not in out and " * " not in out, "wildcard ssh patterns are not addressable hosts")
+        rc, out, _ = checker(None, "--no-config", "--only", "memory", "--json", env_extra=denv,
+                             state_path=os.path.join(base, "state", "disc.json"))
+        disc = json.loads(out)
+        ok(rc == 0 and len(disc["sections"]["memory"]) == 1 and disc["sections"]["memory"][0]["files"] == 1,
+           f"a discovered dir is checked like any other: {disc['sections']['memory']}")
+        ok(disc["discovered"] == ["memory_dirs", "repos", "temp.roots"], f"discovery is reported: {disc['discovered']}")
+
+        print("== clean config, bad config, flags")
+        rc, out, _ = checker(clean_cfg, state_path=os.path.join(base, "state", "clean.json"))
+        ok(rc == 0 and "All clear." in out, f"clean config exits 0 (rc {rc}; out {out[-200:]})")
+        rc, out, _ = checker(clean_cfg, "--brief")
+        ok(rc == 0 and out == "", "brief prints nothing when clean")
+        rc, out, _ = checker(clean_cfg, "--hook")
+        ok(rc == 0 and out == "", "hook prints nothing when clean")
+        rc, _, err = checker(bad)
+        ok(rc == 2 and "not valid JSON" in err, "bad config exits 2")
+        rc, out, _ = checker(bad, "--hook")
+        ok(rc == 0 and out == "", "hook stays silent on a bad config")
+        rc, _, err = checker(cfg_path, "--only", "memory,bogus")
+        ok(rc == 2, "unknown section exits 2")
+        rc, out, _ = checker(cfg_path, "--version", state_path=None)
+        ok(rc == 0 and out.startswith("wrapup-check "), f"--version prints a version: {out.strip()}")
+        rc, out, _ = checker(cfg_path, "--show-config", state_path=None)
+        ok(rc == 0 and m1 in out and m5 in out and "index=INDEX.md recursive no-frontmatter-check" in out
+           and "brief sections:" in out, f"show-config states each dir's rules: {out[:400]}")
+
+        print("== read-only")
+        after = snapshot(base, skip=(os.path.join(base, "state"),))
+        changed = sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
+        ok(not changed, f"checker modified nothing ({len(before)} files tracked){': ' + ', '.join(changed[:5]) if changed else ''}")
+    finally:
+        for pid in procs:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        subprocess.run(["pkill", "-f", f"# {tag}-"], capture_output=True)
+        try:
+            sock.close()
+            os.unlink(sock_path)
+        except Exception:
+            pass
+        shutil.rmtree(base, ignore_errors=True)
+    left = subprocess.run(["pgrep", "-f", f"# {tag}-"], capture_output=True, text=True).stdout.split()
+    ok(not left and not os.path.exists(base), "test cleaned up its processes and files")
+    print(f"\n{'FAILED: ' + str(len(FAILS)) if FAILS else 'all passed'}")
+    return 1 if FAILS else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,22 @@
+{
+  "name": "claude-wrap-up",
+  "owner": {
+    "name": "Miguel Barroso",
+    "url": "https://github.com/Miguel-Barroso"
+  },
+  "metadata": {
+    "description": "wrap-up ends a Claude Code session on purpose rather than by closing the terminal: it consolidates what the session learned into current-state notes, then cleans up only what the session itself left behind. https://github.com/Miguel-Barroso/claude-wrap-up"
+  },
+  "plugins": [
+    {
+      "name": "wrap-up",
+      "source": "./plugin",
+      "description": "End-of-session pass: consolidate memory into current-state notes, then clean up this session's own debris — leftover watchers, schedules, temp files — and report what is still open. A read-only checker does the mechanical part; nothing is deleted that the session did not create.",
+      "author": { "name": "Miguel Barroso" },
+      "homepage": "https://github.com/Miguel-Barroso/claude-wrap-up",
+      "license": "MIT",
+      "category": "productivity",
+      "keywords": ["memory", "housekeeping", "session", "cleanup", "context"]
+    }
+  ]
+}

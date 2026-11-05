@@ -1,0 +1,48 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versions
+        run: |
+          python3 --version
+          git --version
+          ./plugin/skills/wrap-up/wrapup-check --version
+
+      - name: Manifests are valid JSON
+        run: |
+          for f in .claude-plugin/marketplace.json plugin/.claude-plugin/plugin.json \
+                   plugin/hooks/hooks.json plugin/skills/wrap-up/config.example.json; do
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" && echo "ok  $f"
+          done
+
+      - name: Planted-fault tests
+        run: ./plugin/skills/wrap-up/tests/run-tests
+
+      - name: Discovery runs with no config and changes nothing
+        run: |
+          cd "$(mktemp -d)"
+          "$GITHUB_WORKSPACE"/plugin/skills/wrap-up/wrapup-check --no-config --show-config
+          "$GITHUB_WORKSPACE"/plugin/skills/wrap-up/wrapup-check --no-config --no-sizes \
+            --state "$PWD/state.json" || test $? -eq 1
+          test -f "$PWD/state.json" && echo "ok  state written to the path given"
+
+      - name: A clean run exits 0 and says so
+        run: |
+          cd "$(mktemp -d)"
+          printf '{"memory_dirs":[],"repos":[],"temp":{"roots":[]},"schedules":{"dirs":[],"commands":false},"processes":{"include":["^$never"]}}' > empty.json
+          "$GITHUB_WORKSPACE"/plugin/skills/wrap-up/wrapup-check --config empty.json --state "$PWD/s.json" | tee out.txt
+          grep -q "All clear." out.txt

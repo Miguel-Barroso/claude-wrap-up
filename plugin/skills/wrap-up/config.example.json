@@ -1,0 +1,101 @@
+{
+  "_about": "Every wrapup-check setting, with what it is for. You do not need this file: with no config at all, the checker discovers memory directories under the Claude config dir, repositories from each project's recorded working directory, temp roots from the environment, and host aliases from ~/.ssh/config. Copy it to ~/.claude/wrap-up/config.json (or $WRAPUP_CONFIG) only to change a default, and keep only the keys you change — a key you leave out stays discovered. Keys starting with _ are comments. Paths may use ~. Regexes are Python syntax; temp include/exclude are shell globs matched against entry names.",
+
+  "_warning": "This file is executable configuration: remote_hosts[].checks are shell commands run verbatim over ssh. Never paste a config you did not write.",
+
+  "_memory_dirs": "Directories of notes to check. Setting this replaces discovery entirely, so list every directory you want checked. Per-directory keys: label (shown in output), path, index (the index filename, default memory_index), recursive (walk subdirectories, default false), require_frontmatter (default true), include/exclude (globs over paths relative to the directory, matched against the whole relative path or the basename), index_limits (false to disable the load-limit check; defaults to on only for a directory whose index is the global memory_index), types (override memory_types), rules (free text, shown in the output and in --show-config so the model follows this directory's conventions).",
+  "memory_dirs": [
+    {
+      "label": "home",
+      "path": "~/.claude/projects/-Users-you-code/memory",
+      "rules": "Machine and operator facts only. One fact per file, frontmatter with name/description/metadata.type."
+    },
+    {
+      "label": "project-repo",
+      "path": "~/code/my-project/docs/agent-memory",
+      "index": "INDEX.md",
+      "recursive": true,
+      "include": ["knowledge/*.md"],
+      "exclude": ["handoffs/*"],
+      "rules": "Git-backed project knowledge: one file per topic in knowledge/ plus a one-line pointer in INDEX.md, committed on a docs branch via PR."
+    }
+  ],
+
+  "_memory_index": "Default index filename for a directory that does not set its own.",
+  "memory_index": "MEMORY.md",
+  "_memory_types": "Accepted values for metadata.type in a note's frontmatter.",
+  "memory_types": ["user", "feedback", "project", "reference"],
+  "_index_limits": "How much of an auto-loaded index actually reaches context at session start. warn_ratio is when to start warning.",
+  "index_limits": {"lines": 200, "bytes": 25000, "warn_ratio": 0.8},
+
+  "_due": "Dated items: a keyword followed by a YYYY-MM-DD date within max_gap_chars, not crossing a sentence end. Reported when the date is within window_days ahead or lookback_days behind. A line matching ignore_line is skipped, which is how you close one out.",
+  "due": {
+    "window_days": 14,
+    "lookback_days": 30,
+    "max_gap_chars": 30,
+    "keywords": [
+      "EXPIR(?:E|ES|Y|ING)",
+      "delete after",
+      "remove after",
+      "checkpoint",
+      "renew(?:al)?(?: it)? (?:before|by)",
+      "due(?: on| by)?",
+      "deadline",
+      "re-?check (?:on|by|after)",
+      "revisit (?:on|by|after)",
+      "follow[- ]up (?:on|by)"
+    ],
+    "ignore_line": "✅|~~|\\b(?:DONE|CLOSED|SUPERSEDED|done|closed|passed|superseded)\\b"
+  },
+
+  "_processes": "Which processes count as watchers worth reporting. include/exclude are regexes against the full command line; setting either replaces the built-in list. owner_only limits the report to your own uid. Each match is labelled this-session, other-session, orphan or outside-claude by walking its ancestry, and only this-session processes are ever yours to stop.",
+  "processes": {
+    "owner_only": true,
+    "include": [
+      "\\bnohup\\b",
+      "[_-]watch(?:er)?\\b",
+      "\\bpoll(?:er|ing)?(?:\\.sh|\\.py)?\\b",
+      "\\buntil\\b[^⏎]*\\bsleep \\d",
+      "\\bwhile\\b[^⏎]*\\bsleep \\d",
+      "\\btail -[fF]\\b",
+      "\\bgh (?:run watch|pr checks\\b.*--watch)"
+    ],
+    "exclude": ["^/(?:System|Applications|usr/libexec|usr/sbin|Library)/"]
+  },
+
+  "_temp": "Where session scratch files land. Paths newer than the current session's start are reported as this session's; older ones are listed separately and are never claimed. stale_hours is what counts as old for the session-start notice. show caps how many groups the human output lists.",
+  "temp": {
+    "roots": ["/tmp"],
+    "include": ["*"],
+    "exclude": [".*", "claude-*", "tmux-*", "com.apple.*", "*.sock", "systemd-private-*"],
+    "owner_only": true,
+    "stale_hours": 24,
+    "show": 40,
+    "size_max_files": 200000,
+    "size_max_seconds": 8
+  },
+
+  "_schedules": "Things that run again without anyone starting them. With no config the checker reads `crontab -l`, ~/Library/LaunchAgents, ~/.config/systemd/user, `systemctl --user list-timers` and <claude dir>/scheduled-tasks. Only entries created during the current session are flagged; everything else is listed so you can match it against your inventory. dirs replaces that list; commands:false stops it running crontab/systemctl; include promotes anything matching to flagged; exclude hides permanent third-party entries that are never session debris.",
+  "schedules": {
+    "commands": true,
+    "exclude": ["com\\.apple\\.", "com\\.google\\."],
+    "include": []
+  },
+
+  "_repos": "Repositories to report git state for. Setting this replaces discovery. Worktrees and submodules do not need listing: each repo reports its own.",
+  "repos": ["~/code/my-project", "~/code/other-project"],
+
+  "_brief_sections": "Which sections the session-start notice (--brief / --hook) considers.",
+  "brief_sections": ["memory", "due", "processes", "schedules", "temp", "git"],
+
+  "_remote_hosts": "Hosts a bare `--remote` checks. Any alias in ~/.ssh/config can also be checked by naming it (`--remote myhost`) and gets portable default checks, so a host only needs an entry here when the defaults are not enough — a different OS, sudo, containers, or extra places to look. notes is free text shown with the results. Each check runs verbatim over ssh and is echoed before it runs.",
+  "remote_hosts": [
+    {
+      "host": "example-host",
+      "notes": "What this host is, and anything a session needs to know before touching it.",
+      "checks": [
+        {"label": "rollback copies", "cmd": "ls -1dt /root/backups/* 2>/dev/null | head -20", "timeout": 40}
+      ]
+    }
+  ]
+}
